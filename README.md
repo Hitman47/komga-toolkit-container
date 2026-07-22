@@ -10,10 +10,10 @@ ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.4.0-desktop-v2`, restent disponibles
+validée. Les tags versionnés, par exemple `2.4.1-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
 
-La version `2.4.0-desktop-v2` fournit une API sécurisée permettant à une
+La version `2.4.1-desktop-v2` fournit une API sécurisée permettant à une
 application Android d'analyser puis de confirmer les mises à jour du suivi des
 sorties et des prochaines sorties via Manga News ou MangaBaka. Le conteneur
 attend un jeton d'au moins
@@ -44,6 +44,13 @@ appliquent automatiquement en une seule tâche, sans confirmation après le
 déclenchement. Le suivi des sorties n'applique que les changements à confiance
 élevée. Le résultat `rows` contient uniquement les changements effectivement
 écrits, avec un contrat minimal.
+
+La version 2.4.1 applique un limiteur anti-ban partagé à tous les appels Web
+Manga News et MangaBaka. Le délai par défaut est d'une seconde entre deux
+appels, y compris lorsque plusieurs jobs sont lancés en parallèle. Il est
+configurable avec `MANGA_NEWS_AUTOMATION_DELAY_SECONDS` et
+`MANGABAKA_AUTOMATION_DELAY_SECONDS`, sans possibilité de descendre sous le
+minimum de sécurité.
 
 The application stores its own data in `/data`. No host directory is mounted by
 the published Portainer stack.
