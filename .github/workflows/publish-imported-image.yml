@@ -14,11 +14,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out Komga Toolkit source
+      - name: Check out validated container snapshot
         uses: actions/checkout@v4
-        with:
-          repository: Hitman47/komga-toolkit
-          ref: c6e0acbd35b42198b1a359e29692c2bb425da5cc
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -30,7 +27,7 @@ jobs:
       - name: Build and publish immutable and reference tags
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./source
           push: true
           tags: |
             ghcr.io/hitman47/komga-toolkit-container:2.7.0-desktop-v2
