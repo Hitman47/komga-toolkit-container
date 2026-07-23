@@ -1,7 +1,7 @@
 # Komga Toolkit WebUI container
 
 Public container releases for the Komga Toolkit WebUI reference
-`desktop-v3.12.0rc2-20260723`.
+`desktop-v3.12.0rc3-20260723`.
 
 The image is intended for Docker Compose and Portainer deployments:
 
@@ -10,8 +10,13 @@ ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.6.1-desktop-v2`, restent disponibles
+validée. Les tags versionnés, par exemple `2.7.0-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
+
+La version `2.7.0-desktop-v2` aligne Desktop et Web sur la validation
+d’enrichissement des tomes : titre et titre de tri décochés par défaut, sélection
+groupée des confiances élevées, et prise en charge du nombre de pages fourni par
+Manga News ou Bedetheque.
 
 La version `2.6.1-desktop-v2` fournit une API sécurisée permettant à une
 application Android d'analyser puis de confirmer les mises à jour du suivi des
