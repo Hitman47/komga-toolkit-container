@@ -9,6 +9,10 @@ The image is intended for Docker Compose and Portainer deployments:
 ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
+La publication est reconstruite automatiquement depuis le commit validé du
+dépôt `Hitman47/komga-toolkit` ; elle ne dépend plus d’une archive de release
+chargée manuellement.
+
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
 validée. Les tags versionnés, par exemple `2.7.0-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
