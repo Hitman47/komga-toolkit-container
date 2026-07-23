@@ -10,16 +10,22 @@ ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.6.0-desktop-v2`, restent disponibles
+validée. Les tags versionnés, par exemple `2.6.1-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
 
-La version `2.6.0-desktop-v2` fournit une API sécurisée permettant à une
+La version `2.6.1-desktop-v2` fournit une API sécurisée permettant à une
 application Android d'analyser puis de confirmer les mises à jour du suivi des
 sorties et des prochaines sorties via Manga News ou MangaBaka, ainsi que le
 suivi haute confiance des tomes via Bedetheque ou ComicVine. Le conteneur attend
 un jeton d'au moins
 24 caractères dans `KOMGA_TOOLKIT_AUTOMATION_TOKEN` (ou dans le fichier pointé
 par `KOMGA_TOOLKIT_AUTOMATION_TOKEN_FILE`).
+
+La version 2.6.1 fiabilise le chargement des grandes bibliothèques dans Manga
+News et dans les autres écrans d'enrichissement partagés. Les lectures
+d'historique utilisent des POST bornés par lots de 500, leur échec ne masque
+plus les séries Komga, et la page Web détecte automatiquement un bundle ancien
+après redéploiement. La page de démarrage est servie sans cache.
 
 La version 2.6.0 aligne la WebUI sur Komga Toolkit Desktop 3.12.0rc2 et ajoute
 le sous-onglet `Tous les tomes` à l'Explorateur : recherche, filtres par
