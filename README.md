@@ -1,7 +1,7 @@
 # Komga Toolkit WebUI container
 
 Public container releases for the Komga Toolkit WebUI reference
-`desktop-v2-20260722`.
+`desktop-v3.12.0rc2-20260723`.
 
 The image is intended for Docker Compose and Portainer deployments:
 
@@ -10,16 +10,24 @@ ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.5.0-desktop-v2`, restent disponibles
+validée. Les tags versionnés, par exemple `2.6.0-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
 
-La version `2.5.0-desktop-v2` fournit une API sécurisée permettant à une
+La version `2.6.0-desktop-v2` fournit une API sécurisée permettant à une
 application Android d'analyser puis de confirmer les mises à jour du suivi des
 sorties et des prochaines sorties via Manga News ou MangaBaka, ainsi que le
 suivi haute confiance des tomes via Bedetheque ou ComicVine. Le conteneur attend
 un jeton d'au moins
 24 caractères dans `KOMGA_TOOLKIT_AUTOMATION_TOKEN` (ou dans le fichier pointé
 par `KOMGA_TOOLKIT_AUTOMATION_TOKEN_FILE`).
+
+La version 2.6.0 aligne la WebUI sur Komga Toolkit Desktop 3.12.0rc2 et ajoute
+le sous-onglet `Tous les tomes` à l'Explorateur : recherche, filtres par
+bibliothèque, date d'ajout Komga, langue, statut, source et métadonnées
+manquantes, tris, sélection multiple et enrichissement par Manga News,
+Bedetheque ou ComicVine. Desktop et Web partagent désormais les mêmes
+garde-fous : numéro, ordre numérique et ISBN protégés, résumé de faible qualité
+ignoré et validation explicite des correspondances ambiguës.
 
 La version 2.5.0 ajoute les routes `/run`, `/preview` et `/confirm` pour
 Bedetheque et ComicVine. Les traitements restent limités aux séries non
