@@ -10,15 +10,23 @@ ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.4.1-desktop-v2`, restent disponibles
+validée. Les tags versionnés, par exemple `2.5.0-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
 
-La version `2.4.1-desktop-v2` fournit une API sécurisée permettant à une
+La version `2.5.0-desktop-v2` fournit une API sécurisée permettant à une
 application Android d'analyser puis de confirmer les mises à jour du suivi des
-sorties et des prochaines sorties via Manga News ou MangaBaka. Le conteneur
-attend un jeton d'au moins
+sorties et des prochaines sorties via Manga News ou MangaBaka, ainsi que le
+suivi haute confiance des tomes via Bedetheque ou ComicVine. Le conteneur attend
+un jeton d'au moins
 24 caractères dans `KOMGA_TOOLKIT_AUTOMATION_TOKEN` (ou dans le fichier pointé
 par `KOMGA_TOOLKIT_AUTOMATION_TOKEN_FILE`).
+
+La version 2.5.0 ajoute les routes `/run`, `/preview` et `/confirm` pour
+Bedetheque et ComicVine. Les traitements restent limités aux séries non
+terminées déjà liées à la source, refusent toute diminution ou hausse trop
+rapide de `totalBookCount`, revalident Komga avant écriture et ne renvoient dans
+`rows` que les changements réellement appliqués. Elle restaure également les
+genres réels fournis par Manga News V2.
 
 La version 2.2.1 corrige la classification Manga News lorsque `media_kind`
 n'est pas renvoyé et distingue désormais clairement `À vérifier` de
