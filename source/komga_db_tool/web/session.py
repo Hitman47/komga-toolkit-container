@@ -72,9 +72,10 @@ class WebSessionStore:
             "comicvine": {"next_allowed": 0.0, "lock": threading.Lock()},
         }
         self._external_request_delays = {
-            "bedetheque": _request_delay_from_env(
-                "BEDETHEQUE_AUTOMATION_DELAY_SECONDS", 2.0
-            ),
+            # Interactive website scraping keeps its protection. Bedetheque
+            # automations use BedethequeCsvClient directly and never use this
+            # limiter.
+            "bedetheque": 2.0,
             "manga_news": _request_delay_from_env(
                 "MANGA_NEWS_AUTOMATION_DELAY_SECONDS", 1.0
             ),
@@ -88,7 +89,9 @@ class WebSessionStore:
         self._matching = MatchingConfig()
 
     def automation_request_delays(self) -> dict[str, float]:
-        return dict(self._external_request_delays)
+        delays = dict(self._external_request_delays)
+        delays["bedetheque"] = 0.0
+        return delays
 
     def _rate_limited_source_client(self, provider: str, client: Any) -> RateLimitedSourceClient:
         return RateLimitedSourceClient(
