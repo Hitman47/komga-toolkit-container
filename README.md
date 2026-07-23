@@ -10,7 +10,7 @@ ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
 La publication est reconstruite automatiquement depuis le snapshot strict du
-commit validé `69b49dc854280cb8b97f5c63ac7e2af764c92bc2`, conservé dans `source/`.
+commit validé `e7f27d9a756d5f2c63ffafefd67b240cc92575ba`, conservé dans `source/`.
 Ce snapshot ne contient que le Dockerfile, les roues/dépendances Docker et le
 code applicatif nécessaire à l’image. Il ne contient ni configuration locale,
 ni identifiant, ni exécutable Desktop.
@@ -23,7 +23,10 @@ Les routes d'automatisation Bedetheque utilisent exclusivement le CSV persistant
 `/data/uploads/bedetheque.csv`. Elles ne contactent jamais le site Bedetheque et
 refusent de démarrer tant que le CSV n'est pas disponible. Le contrat HTTP
 reste inchangé. Ces lectures étant locales, aucun délai n'est appliqué entre
-deux séries Bedetheque.
+deux séries Bedetheque. Le fichier reste dans le volume `/data` après
+rafraîchissement, reconnexion ou recréation du conteneur. Un nouvel upload
+valide le remplace atomiquement ; un fichier invalide ne détruit pas la copie
+existante.
 
 La version `2.7.0-desktop-v2` aligne Desktop et Web sur la validation
 d’enrichissement des tomes : titre et titre de tri décochés par défaut, sélection

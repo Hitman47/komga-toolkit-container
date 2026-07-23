@@ -13,6 +13,8 @@ from .bedetheque import (
     title_similarity,
 )
 
+REQUIRED_COLUMNS = {"serieTitle", "serieUrl", "tomesCount"}
+
 
 def _status(value: str) -> str:
     folded = _fold(value)
@@ -66,10 +68,24 @@ class BedethequeCsvClient:
             if cached and cached[0] == stamp:
                 return cached[1]
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream, delimiter=";")
+            columns = {str(name or "").strip() for name in (reader.fieldnames or [])}
+            missing = sorted(REQUIRED_COLUMNS - columns)
+            if missing:
+                raise ValueError(
+                    "CSV Bedetheque invalide : colonne(s) obligatoire(s) absente(s) : "
+                    + ", ".join(missing)
+                )
             rows = [
                 {str(key): str(value or "") for key, value in row.items()}
-                for row in csv.DictReader(stream, delimiter=";")
+                for row in reader
             ]
+        if not rows:
+            raise ValueError("CSV Bedetheque invalide : aucune série disponible")
+        if not any(row.get("serieTitle", "").strip() and row.get("serieUrl", "").strip() for row in rows):
+            raise ValueError(
+                "CSV Bedetheque invalide : aucune série ne possède un titre et une URL"
+            )
         with self._cache_lock:
             self._cache[key] = (stamp, rows)
         return rows

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import os
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -52,15 +53,22 @@ class WebSessionStore:
         self._automatic_timeout = max(3, min(300, configured_timeout))
         data_dir = Path(os.getenv("KOMGA_TOOLKIT_DATA_DIR") or ".komga_db_tool_cache/web")
         default_bedetheque_csv = data_dir / "uploads" / "bedetheque.csv"
+        configured_bedetheque_csv = Path(
+            os.getenv("BEDETHEQUE_CSV_PATH") or default_bedetheque_csv
+        )
+        self._bedetheque_csv_storage_path = default_bedetheque_csv
+        active_bedetheque_csv = (
+            default_bedetheque_csv
+            if default_bedetheque_csv.is_file()
+            else configured_bedetheque_csv
+        )
         self._source_config: dict[str, Any] = {
             "manga_news_url": os.getenv("MANGA_NEWS_BASE_URL") or "http://host.docker.internal:8017",
             "manga_news_token": "",
             "mangabaka_url": DEFAULT_MANGABAKA_API_BASE_URL,
             "comicvine_url": os.getenv("COMICVINE_BASE_URL") or DEFAULT_COMICVINE_API_BASE_URL,
             "comicvine_api_key": "",
-            "bedetheque_csv_path": str(
-                Path(os.getenv("BEDETHEQUE_CSV_PATH") or default_bedetheque_csv)
-            ),
+            "bedetheque_csv_path": str(active_bedetheque_csv),
             "bedetheque_csv_only": False,
             "timeout": 30,
             "cache_dir": str(data_dir / "cache"),
@@ -231,6 +239,11 @@ class WebSessionStore:
         with self._lock:
             cfg = dict(self._source_config)
         bedetheque_csv_path = Path(str(cfg["bedetheque_csv_path"] or "")).expanduser()
+        bedetheque_csv_stat = (
+            bedetheque_csv_path.stat()
+            if bedetheque_csv_path.is_file()
+            else None
+        )
         return {
             "manga_news_url": cfg["manga_news_url"],
             "manga_news_token_configured": bool(cfg["manga_news_token"]),
@@ -241,8 +254,22 @@ class WebSessionStore:
                 or self._automatic_comicvine_api_key
                 or self._automatic_comicvine_api_key_file
             ),
-            "bedetheque_csv_configured": bedetheque_csv_path.is_file(),
+            "bedetheque_csv_configured": bedetheque_csv_stat is not None,
             "bedetheque_csv_only": bool(cfg["bedetheque_csv_only"]),
+            "bedetheque_csv_filename": (
+                bedetheque_csv_path.name if bedetheque_csv_stat is not None else ""
+            ),
+            "bedetheque_csv_size_bytes": (
+                bedetheque_csv_stat.st_size if bedetheque_csv_stat is not None else 0
+            ),
+            "bedetheque_csv_updated_at": (
+                datetime.fromtimestamp(
+                    bedetheque_csv_stat.st_mtime,
+                    tz=timezone.utc,
+                ).isoformat()
+                if bedetheque_csv_stat is not None
+                else ""
+            ),
             "timeout": cfg["timeout"],
         }
 
@@ -295,6 +322,28 @@ class WebSessionStore:
                 "un CSV Bedetheque dans les paramètres WebUI."
             )
         return BedethequeCsvClient(str(path))
+
+    def persist_bedetheque_csv(self, data: bytes) -> dict[str, Any]:
+        """Validate and atomically replace the persistent Bedetheque catalog."""
+        with self._lock:
+            path = self._bedetheque_csv_storage_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.uploading")
+            try:
+                with temporary.open("wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                validation = BedethequeCsvClient(str(temporary)).test()
+                temporary.replace(path)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+            self._source_config["bedetheque_csv_path"] = str(path)
+            self._source_config["bedetheque_csv_only"] = True
+            result = self.public_sources()
+            result["bedetheque_csv_validation"] = validation
+            return result
 
     def bedetheque_automation_client(self) -> BedethequeCsvClient:
         """Return the mandatory CSV client used by every Bedetheque automation."""

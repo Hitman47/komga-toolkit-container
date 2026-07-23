@@ -386,14 +386,7 @@ async def upload_bedetheque_csv(request: Request) -> dict:
     if not data or len(data) > 100 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="CSV Bedetheque vide ou supérieur à 100 Mio")
     try:
-        data_dir = Path(os.getenv("KOMGA_TOOLKIT_DATA_DIR") or ".komga_db_tool_cache/web")
-        upload_dir = data_dir / "uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        path = upload_dir / "bedetheque.csv"
-        temporary = upload_dir / "bedetheque.csv.tmp"
-        temporary.write_bytes(data)
-        temporary.replace(path)
-        return session_store.configure_sources({"bedetheque_csv_path": str(path), "bedetheque_csv_only": True})
+        return session_store.persist_bedetheque_csv(data)
     except Exception as exc:
         raise domain_error(exc) from exc
 
