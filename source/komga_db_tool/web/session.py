@@ -51,13 +51,16 @@ class WebSessionStore:
             configured_timeout = 30
         self._automatic_timeout = max(3, min(300, configured_timeout))
         data_dir = Path(os.getenv("KOMGA_TOOLKIT_DATA_DIR") or ".komga_db_tool_cache/web")
+        default_bedetheque_csv = data_dir / "uploads" / "bedetheque.csv"
         self._source_config: dict[str, Any] = {
             "manga_news_url": os.getenv("MANGA_NEWS_BASE_URL") or "http://host.docker.internal:8017",
             "manga_news_token": "",
             "mangabaka_url": DEFAULT_MANGABAKA_API_BASE_URL,
             "comicvine_url": os.getenv("COMICVINE_BASE_URL") or DEFAULT_COMICVINE_API_BASE_URL,
             "comicvine_api_key": "",
-            "bedetheque_csv_path": "",
+            "bedetheque_csv_path": str(
+                Path(os.getenv("BEDETHEQUE_CSV_PATH") or default_bedetheque_csv)
+            ),
             "bedetheque_csv_only": False,
             "timeout": 30,
             "cache_dir": str(data_dir / "cache"),
@@ -224,6 +227,7 @@ class WebSessionStore:
     def public_sources(self) -> dict[str, Any]:
         with self._lock:
             cfg = dict(self._source_config)
+        bedetheque_csv_path = Path(str(cfg["bedetheque_csv_path"] or "")).expanduser()
         return {
             "manga_news_url": cfg["manga_news_url"],
             "manga_news_token_configured": bool(cfg["manga_news_token"]),
@@ -234,7 +238,7 @@ class WebSessionStore:
                 or self._automatic_comicvine_api_key
                 or self._automatic_comicvine_api_key_file
             ),
-            "bedetheque_csv_configured": bool(cfg["bedetheque_csv_path"]),
+            "bedetheque_csv_configured": bedetheque_csv_path.is_file(),
             "bedetheque_csv_only": bool(cfg["bedetheque_csv_only"]),
             "timeout": cfg["timeout"],
         }
@@ -270,13 +274,28 @@ class WebSessionStore:
     def bedetheque_client(self) -> BedethequeClient | BedethequeCsvClient | RateLimitedSourceClient:
         with self._lock:
             cfg = dict(self._source_config)
-        if cfg["bedetheque_csv_only"] and cfg["bedetheque_csv_path"]:
-            return BedethequeCsvClient(cfg["bedetheque_csv_path"])
+        if cfg["bedetheque_csv_only"]:
+            return self.bedetheque_csv_client()
         timeout = int(cfg["timeout"])
         return self._rate_limited_source_client(
             "bedetheque",
             BedethequeClient(timeout=timeout),
         )
+
+    def bedetheque_csv_client(self) -> BedethequeCsvClient:
+        with self._lock:
+            csv_path = str(self._source_config["bedetheque_csv_path"] or "").strip()
+        path = Path(csv_path).expanduser() if csv_path else None
+        if path is None or not path.is_file():
+            raise RuntimeError(
+                "Automatisation Bedetheque indisponible : chargez d'abord "
+                "un CSV Bedetheque dans les paramètres WebUI."
+            )
+        return BedethequeCsvClient(str(path))
+
+    def bedetheque_automation_client(self) -> BedethequeCsvClient:
+        """Return the mandatory CSV client used by every Bedetheque automation."""
+        return self.bedetheque_csv_client()
 
     def manga_news_client(self) -> RateLimitedSourceClient:
         with self._lock:

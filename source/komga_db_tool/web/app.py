@@ -997,9 +997,13 @@ def start_guided_release_tracking_apply(payload: ReleaseTrackingGuidedApplyReque
     return jobs.submit(f"Application guidée {source}", action).public()
 
 
-def _release_tracking_client(source: str) -> Any:
+def _release_tracking_client(source: str, *, automation: bool = False) -> Any:
     factories = {
-        "bedetheque": session_store.bedetheque_client,
+        "bedetheque": (
+            session_store.bedetheque_automation_client
+            if automation
+            else session_store.bedetheque_client
+        ),
         "manga_news": session_store.manga_news_client,
         "mangabaka": session_store.mangabaka_client,
         "comicvine": session_store.comicvine_client,
@@ -1008,11 +1012,13 @@ def _release_tracking_client(source: str) -> Any:
         return factories[source]()
     except KeyError as exc:
         raise HTTPException(status_code=400, detail="Source de suivi invalide") from exc
+    except Exception as exc:
+        raise domain_error(exc) from exc
 
 
 def _start_automation_release_tracking_preview(source: str, library_id: str) -> dict:
     api = api_or_401()
-    client = _release_tracking_client(source)
+    client = _release_tracking_client(source, automation=True)
 
     def action(progress, cancelled):
         return prepare_guided_release_tracking(
@@ -1068,7 +1074,7 @@ def _start_automation_next_release_preview(source: str, library_id: str) -> dict
 
 def _start_automatic_release_tracking(source: str, library_id: str) -> dict:
     api = api_or_401()
-    client = _release_tracking_client(source)
+    client = _release_tracking_client(source, automation=True)
 
     def action(progress, cancelled):
         return run_guided_release_tracking_automation(
@@ -1233,7 +1239,7 @@ def automation_status() -> dict:
         "request_delays_seconds": session_store.automation_request_delays(),
         "sources": ["bedetheque", "manga_news", "mangabaka", "comicvine"],
         "source_ready": {
-            "bedetheque": True,
+            "bedetheque": bool(source_settings.get("bedetheque_csv_configured")),
             "manga_news": True,
             "mangabaka": True,
             "comicvine": bool(source_settings.get("comicvine_api_key_configured")),
