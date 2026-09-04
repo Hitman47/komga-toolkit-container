@@ -9,11 +9,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
 
+from .bedetheque import title_similarity
+from .chapter_cleanup import preserve_chapter_series_title_suffix
+from .metadata_cleanup import filter_incoming_alternate_titles, title_script_language
+from .metadata_quality import is_low_value_summary, normalize_write_language
+
 APP_USER_AGENT = "komga-db-tool/0.6.0 mangabaka-adapter"
 DEFAULT_API_BASE_URL = "https://api.mangabaka.org"
 MANGABAKA_SITE_URL = "https://mangabaka.org"
 SEARCH_CACHE_TTL_SECONDS = 2 * 60 * 60
 LOOKUP_CACHE_TTL_SECONDS = 12 * 60 * 60
+MANGABAKA_AUTOMATCH_MIN_SCORE = 0.90
+MANGABAKA_AUTOMATCH_MIN_MARGIN = 0.05
+_CHAP_SUFFIX_RE = re.compile(r"\s*\(\s*chap\s*\)\s*$", re.IGNORECASE)
 
 STATUS_MAP = {
     "completed": "ENDED",
@@ -105,6 +113,155 @@ def _safe_str(value: Any) -> str:
     return str(value).strip()
 
 
+def mangabaka_search_title(value: Any) -> str:
+    """Return the Komga title used for MangaBaka search/matching only.
+
+    A final ``(Chap)`` is an internal Komga marker and must never reduce the
+    source score. Metadata writing deliberately uses the untouched Komga title.
+    """
+    return re.sub(r"\s+", " ", _CHAP_SUFFIX_RE.sub("", str(value or ""))).strip()
+
+
+def _title_values(value: Any) -> List[str]:
+    rows: List[str] = []
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            rows.append(text)
+    elif isinstance(value, dict):
+        preferred = value.get("title") or value.get("name") or value.get("value")
+        if preferred:
+            rows.extend(_title_values(preferred))
+        else:
+            for nested in value.values():
+                rows.extend(_title_values(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            rows.extend(_title_values(nested))
+    return rows
+
+
+def mangabaka_match_score(query: Any, row: Any) -> float:
+    """Score a MangaBaka result/candidate against all useful source titles."""
+    query_title = mangabaka_search_title(query)
+    raw = getattr(row, "raw", {}) if not isinstance(row, dict) else row.get("raw", row)
+    raw = raw if isinstance(raw, dict) else {}
+    titles = [getattr(row, "title", "") if not isinstance(row, dict) else row.get("title", "")]
+    for key in ("title", "native_title", "romanized_title", "secondary_titles", "titles"):
+        titles.extend(_title_values(raw.get(key)))
+    scores = [title_similarity(query_title, mangabaka_search_title(title)) for title in titles if str(title or "").strip()]
+    return max(scores, default=0.0)
+
+
+def mangabaka_primary_match_score(query: Any, row: Any) -> float:
+    """Score only the title displayed as the result's primary title."""
+    title = getattr(row, "title", "") if not isinstance(row, dict) else row.get("title", "")
+    return title_similarity(mangabaka_search_title(query), mangabaka_search_title(title))
+
+
+def ranked_mangabaka_choices(
+    query: Any,
+    results: List[MangaBakaSearchResult],
+    *,
+    min_score: float = MANGABAKA_AUTOMATCH_MIN_SCORE,
+    limit: int = 5,
+) -> List[tuple[MangaBakaSearchResult, float]]:
+    """Return manga candidates in the exact order used by automatch."""
+    scored = [
+        (mangabaka_primary_match_score(query, row), mangabaka_match_score(query, row), row)
+        for row in results
+        if str(row.type or "").casefold() == "manga"
+    ]
+    use_primary_scores = any(primary >= float(min_score) for primary, _all_titles, _row in scored)
+    ranked = sorted(
+        scored,
+        key=lambda item: (
+            -(item[0] if use_primary_scores else item[1]),
+            -item[0],
+            str(item[2].title or "").casefold(),
+            str(item[2].id or ""),
+        ),
+    )
+    return [
+        (row, primary if use_primary_scores else all_titles)
+        for primary, all_titles, row in ranked[: max(0, int(limit))]
+    ]
+
+
+def select_mangabaka_automatch(
+    query: Any,
+    results: List[MangaBakaSearchResult],
+    *,
+    min_score: float = MANGABAKA_AUTOMATCH_MIN_SCORE,
+    min_margin: float = MANGABAKA_AUTOMATCH_MIN_MARGIN,
+) -> tuple[Optional[MangaBakaSearchResult], str, float, float, int]:
+    """Choose one clearly superior manga result or return an explicit refusal."""
+    ranked = ranked_mangabaka_choices(query, results, min_score=min_score, limit=len(results))
+    if not ranked:
+        return None, "Échec : aucun résultat manga", 0.0, 0.0, 0
+    best, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best_score < float(min_score):
+        return None, "Échec : score titre insuffisant", best_score, second_score, len(ranked)
+    if len(ranked) > 1 and best_score - second_score < float(min_margin):
+        return None, "À vérifier : résultats ambigus", best_score, second_score, len(ranked)
+    return best, "Correspondance sûre", best_score, second_score, len(ranked)
+
+
+def conservative_mangabaka_payload(
+    current: Dict[str, Any] | None,
+    candidate: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Build the conservative MangaBaka batch payload without GUI dependencies."""
+    before = dict(current or {})
+    proposed = preserve_chapter_series_title_suffix(before, candidate)
+    payload: Dict[str, Any] = {}
+    critical = {"title", "titleSort", "status", "totalBookCount"}
+    list_fields = {"genres", "tags", "alternateTitles", "links", "authors"}
+
+    def blank(value: Any) -> bool:
+        return value is None or value == "" or value == [] or value == {}
+
+    def identity(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    def merged_list(field: str, old: Any, new: Any) -> List[Any]:
+        merged: List[Any] = []
+        seen: set[str] = set()
+        for value in list(old or []) + list(new or []):
+            if field == "links" and isinstance(value, dict):
+                key = str(value.get("url") or "").strip().casefold()
+            elif field == "alternateTitles" and isinstance(value, dict):
+                key = f"{value.get('label', '')}|{value.get('title', '')}".casefold()
+            elif field == "authors" and isinstance(value, dict):
+                key = f"{value.get('name', '')}|{value.get('role', '')}".casefold()
+            else:
+                key = str(value or "").strip().casefold()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(value)
+        return merged
+
+    for field, value in proposed.items():
+        if blank(value) or field.endswith("Lock"):
+            continue
+        if field == "summary" and is_low_value_summary(value):
+            continue
+        if field == "language":
+            value = normalize_write_language(value)
+            if not value:
+                continue
+        old = before.get(field)
+        if field in list_fields:
+            merged = merged_list(field, old, value)
+            if identity(merged) != identity(old or []):
+                payload[field] = merged
+        elif field in critical or blank(old) or (field == "language" and not normalize_write_language(old)):
+            if identity(value) != identity(old):
+                payload[field] = value
+    return payload
+
+
 def _dedupe_strings(values: List[Any]) -> List[str]:
     out: List[str] = []
     seen: set[str] = set()
@@ -118,6 +275,24 @@ def _dedupe_strings(values: List[Any]) -> List[str]:
         seen.add(key)
         out.append(text)
     return out
+
+
+def _contributor_entries(series: Dict[str, Any]) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, role in (("authors", "writer"), ("artists", "penciller")):
+        raw_values = series.get(key)
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        for raw in values:
+            if isinstance(raw, dict):
+                name = _safe_str(raw.get("name") or raw.get("title") or raw.get("value"))
+            else:
+                name = _safe_str(raw)
+            identity = (name.casefold(), role)
+            if name and identity not in seen:
+                seen.add(identity)
+                entries.append({"name": name, "role": role})
+    return entries
 
 
 def _int_or_none(value: Any) -> Optional[int]:
@@ -328,6 +503,44 @@ def _guess_alternate_title_label(value: str) -> str:
         return "ru"
     return "alt"
 
+
+def _alternate_title_entries_for_series(series: Dict[str, Any], primary_title: str) -> List[Dict[str, str]]:
+    """Preserve source language labels instead of flattening secondary titles."""
+    entries: List[Dict[str, str]] = []
+
+    def add(label: Any, value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                add(label, item)
+            return
+        if isinstance(value, dict):
+            nested_label = value.get("language") or value.get("lang") or value.get("locale") or label
+            add(nested_label, value.get("title") or value.get("name") or value.get("value"))
+            return
+        text = _safe_str(value)
+        if text:
+            entries.append({"label": _safe_str(label) or "alt", "title": text})
+
+    source_language = _infer_language(series)
+    for key in ("native_title", "nativeTitle"):
+        value = _safe_str(series.get(key))
+        add(title_script_language(value) or source_language or "alt", value)
+    for key in ("romanized_title", "romanizedTitle"):
+        add(source_language or "alt", series.get(key))
+
+    secondary = series.get("secondary_titles") or series.get("secondaryTitles")
+    if isinstance(secondary, dict):
+        for language, values in secondary.items():
+            add(language, values)
+    elif isinstance(secondary, list):
+        for item in secondary:
+            if isinstance(item, dict):
+                add(item.get("language") or item.get("lang") or item.get("locale") or "alt", item)
+            else:
+                add("alt", item)
+
+    return filter_incoming_alternate_titles(entries, primary_title=primary_title)
+
 def _secondary_language_candidates(secondary_titles: Any) -> List[str]:
     candidates: List[str] = []
     if isinstance(secondary_titles, dict):
@@ -467,9 +680,10 @@ def _map_series_metadata(series: Dict[str, Any]) -> Dict[str, Any]:
     if publisher:
         metadata["publisher"] = publisher
 
-    language = _infer_language(series)
-    if language:
-        metadata["language"] = language
+    # MangaBaka is used here as the English-edition catalogue.  Its API also
+    # exposes the original work language (often ja/ko/zh), which must not be
+    # confused with the reading language of the Komga edition.
+    metadata["language"] = "en"
 
     age_rating = _map_age_rating(series.get("content_rating") or series.get("contentRating"))
     if age_rating is not None:
@@ -491,21 +705,13 @@ def _map_series_metadata(series: Dict[str, Any]) -> Dict[str, Any]:
         if cleaned:
             metadata["tags"] = cleaned
 
-    alternate_titles = _dedupe_strings([
-        series.get("native_title"),
-        series.get("nativeTitle"),
-        series.get("romanized_title"),
-        series.get("romanizedTitle"),
-        *_title_candidates_from_secondary(series.get("secondary_titles") or series.get("secondaryTitles")),
-    ])
-    if title:
-        alternate_titles = [x for x in alternate_titles if x.casefold() != title.casefold()]
+    alternate_titles = _alternate_title_entries_for_series(series, title)
     if alternate_titles:
-        metadata["alternateTitles"] = [
-            {"label": _guess_alternate_title_label(value), "title": value}
-            for value in alternate_titles
-            if isinstance(value, str) and value.strip()
-        ]
+        metadata["alternateTitles"] = alternate_titles
+
+    authors = _contributor_entries(series)
+    if authors:
+        metadata["authors"] = authors
 
     links = _links_from_series(series)
     if links:
@@ -626,7 +832,15 @@ class MangaBakaClient:
                 data = json.loads(text)
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"MangaBaka HTTP {exc.code}: {body[:500]}") from exc
+            wrapped = RuntimeError(f"MangaBaka HTTP {exc.code}: {body[:500]}")
+            # Keep the structured HTTP information available to the shared
+            # rate-limit proxy. The human-readable message remains unchanged
+            # for logs and existing callers.
+            wrapped.code = exc.code  # type: ignore[attr-defined]
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            if retry_after not in (None, ""):
+                wrapped.retry_after_seconds = retry_after  # type: ignore[attr-defined]
+            raise wrapped from exc
         except error.URLError as exc:
             raise RuntimeError(f"MangaBaka connexion impossible: {exc}") from exc
         except TimeoutError as exc:

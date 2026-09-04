@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from .bedetheque import title_similarity
+from .chapter_cleanup import has_chapter_title_suffix
 from .metadata_quality import (
     is_low_value_summary,
     is_supported_write_language,
@@ -20,6 +21,7 @@ BOOK_SOURCE_LABELS = {
     "bedetheque": "Bedetheque",
     "comicvine": "ComicVine",
     "mangabaka": "MangaBaka",
+    "nautiljon": "Nautiljon",
 }
 BOOK_SOURCE_CAPABILITIES = {
     "manga_news": {
@@ -35,20 +37,8 @@ BOOK_SOURCE_CAPABILITIES = {
         "tags",
         "links",
     },
-    "bedetheque": {
-        "title",
-        "titleSort",
-        "summary",
-        "releaseDate",
-        "publisher",
-        "language",
-        "isbn",
-        "authors",
-        "numberOfPages",
-        "tags",
-        "links",
-        "ageRating",
-    },
+    # The supported Bedetheque CSV contains series-level rows only.
+    "bedetheque": set(),
     "comicvine": {
         "title",
         "titleSort",
@@ -62,6 +52,7 @@ BOOK_SOURCE_CAPABILITIES = {
     # MangaBaka is intentionally visible as a mapped series source, but its
     # current client does not expose volume-level metadata.
     "mangabaka": set(),
+    "nautiljon": set(),
 }
 DEFAULT_BOOK_ENRICHMENT_FIELDS = (
     "title",
@@ -162,7 +153,9 @@ def book_enrichment_payload(
             continue
         if _same(current_value, value):
             continue
-        if field in {"title", "titleSort"} or _blank(current_value):
+        if field in {"title", "titleSort", "summary"} or _blank(current_value) or (
+            field == "language" and not is_supported_write_language(current_value)
+        ):
             payload[field] = value
 
     current_title = _text(current_map.get("title"))
@@ -201,6 +194,7 @@ def normalize_source(value: Any) -> str:
         "bédéthèque": "bedetheque",
         "manganews": "manga_news",
         "mangabaka": "mangabaka",
+        "nautiljon": "nautiljon",
         "comicvine": "comicvine",
         "gamespot": "comicvine",
     }
@@ -221,6 +215,8 @@ def source_from_url(url: Any) -> str:
         return "manga_news"
     if "mangabaka" in host:
         return "mangabaka"
+    if "nautiljon" in host:
+        return "nautiljon"
     if "comicvine" in host or "gamespot" in host:
         return "comicvine"
     return ""
@@ -283,12 +279,25 @@ def choose_book_source(
         return SourceChoice(requested, links[requested], available, "Source imposée et liée à la série.")
 
     wanted = set(fields)
-    compatible = [source for source in BOOK_SOURCE_PRIORITY if source in links]
+    compatible = [
+        source
+        for source in BOOK_SOURCE_PRIORITY
+        if source in links and BOOK_SOURCE_CAPABILITIES.get(source)
+    ]
     if not compatible:
-        if "mangabaka" in links:
+        unavailable = [
+            BOOK_SOURCE_LABELS[source]
+            for source in (*BOOK_SOURCE_PRIORITY, "mangabaka")
+            if source in links and not BOOK_SOURCE_CAPABILITIES.get(source)
+        ]
+        if unavailable:
             return SourceChoice(
                 available=available,
-                reason="La série est liée uniquement à MangaBaka, qui ne fournit pas de métadonnées par tome.",
+                reason=(
+                    "La série est liée uniquement à "
+                    + ", ".join(unavailable)
+                    + ", qui ne fournit pas de métadonnées par tome."
+                ),
             )
         return SourceChoice(available=available, reason="La série ne possède aucune source compatible pour les tomes.")
     ranked = sorted(
@@ -381,6 +390,7 @@ def filter_book_rows(
     source_filter: str = "all",
     missing_field: str = "",
     empty_summary: bool = False,
+    hide_chapter_series: bool = False,
 ) -> list[dict[str, Any]]:
     needle = _fold(query)
     language_folded = _fold(language)
@@ -389,6 +399,8 @@ def filter_book_rows(
     missing_field = _text(missing_field)
     out: list[dict[str, Any]] = []
     for row in rows:
+        if hide_chapter_series and has_chapter_title_suffix(row.get("series_title")):
+            continue
         if needle:
             authors = row.get("authors") or []
             if isinstance(authors, list):
@@ -419,8 +431,13 @@ def filter_book_rows(
                 continue
         if language_folded and _fold(row.get("language")) != language_folded:
             continue
-        if status_folded and status_folded != "all" and _fold(row.get("series_status")) != status_folded:
-            continue
+        if status_folded and status_folded != "all":
+            current_status = _fold(row.get("series_status"))
+            if status_folded == "not ended":
+                if current_status in {"ended", "abandoned"}:
+                    continue
+            elif current_status != status_folded:
+                continue
         sources = set(row.get("source_names") or ())
         if source_filter == "with_any" and not sources:
             continue

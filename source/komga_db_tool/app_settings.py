@@ -7,6 +7,7 @@ from typing import Any
 from .comicvine import DEFAULT_COMICVINE_API_BASE_URL
 from .manga_news import DEFAULT_MANGA_NEWS_API_BASE_URL
 from .mangabaka import DEFAULT_API_BASE_URL
+from .metron import DEFAULT_METRON_API_BASE_URL
 from .secure_config import SecureConfigStore
 
 
@@ -32,8 +33,12 @@ class ServiceSettings:
 
 @dataclass
 class BedethequeSettings:
-    mode: str = "web"
     csv_path: str = "X:/AppData/MangaTracker/docs/bedetheque/bedetheque.csv"
+
+
+@dataclass
+class NautiljonSettings:
+    csv_path: str = "N:/AppData/MangaTracker/docs/nautiljon.csv"
 
 
 @dataclass
@@ -66,6 +71,16 @@ class ComicVineSettings:
 
 
 @dataclass
+class MetronSettings:
+    url: str = DEFAULT_METRON_API_BASE_URL
+    enabled: bool = True
+    timeout_seconds: int = 45
+    token: str = ""
+    cache_enabled: bool = True
+    cache_dir: str = ".komga_db_tool_cache/metron"
+
+
+@dataclass
 class MatchingConfig:
     title_score_min: float = 0.90
     loaded_title_score_min: float = 0.90
@@ -82,9 +97,11 @@ class AppConfig:
     komga: KomgaSettings = field(default_factory=KomgaSettings)
     komf: ServiceSettings = field(default_factory=ServiceSettings)
     bedetheque: BedethequeSettings = field(default_factory=BedethequeSettings)
+    nautiljon: NautiljonSettings = field(default_factory=NautiljonSettings)
     mangabaka: SourceSettings = field(default_factory=SourceSettings)
     manga_news: MangaNewsSettings = field(default_factory=MangaNewsSettings)
     comicvine: ComicVineSettings = field(default_factory=ComicVineSettings)
+    metron: MetronSettings = field(default_factory=MetronSettings)
     matching: MatchingConfig = field(default_factory=MatchingConfig)
     simulation: bool = True
     backup_root: str = "_komga_db_tool_backups"
@@ -101,9 +118,11 @@ class AppConfig:
             komga=_section(KomgaSettings, data.get("komga")),
             komf=_section(ServiceSettings, data.get("komf")),
             bedetheque=_section(BedethequeSettings, data.get("bedetheque")),
+            nautiljon=_section(NautiljonSettings, data.get("nautiljon")),
             mangabaka=_section(SourceSettings, data.get("mangabaka")),
             manga_news=_section(MangaNewsSettings, data.get("manga_news")),
             comicvine=_section(ComicVineSettings, data.get("comicvine")),
+            metron=_section(MetronSettings, data.get("metron")),
             matching=_section(MatchingConfig, data.get("matching")),
             simulation=bool(data.get("simulation", True)),
             backup_root=str(data.get("backup_root") or "_komga_db_tool_backups"),

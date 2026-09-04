@@ -10,12 +10,14 @@ import tempfile
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, unquote, urlparse
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, QThreadPool, Qt, Signal, QTimer, QUrl
+from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, QRunnable, QThreadPool, Qt, Signal, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,6 +44,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -54,11 +57,33 @@ from PySide6.QtWidgets import (
 
 from .api import AuthConfig, CollectionItem, KomfApi, KomgaApi, ReadlistItem, parse_cell_value, safe_str
 from .backup import BackupManager, list_rollback_records, load_rollback_snapshot
-from .bedetheque import BedethequeCandidate, BedethequeClient, BedethequeSearchResult, normalize_volume_number, title_similarity
+from .bedetheque import BedethequeCandidate, BedethequeSearchResult, candidate_to_dict, normalize_volume_number, title_similarity
 from .bedetheque_csv import BedethequeCsvClient
 from .comicvine import DEFAULT_COMICVINE_API_BASE_URL, ComicVineCandidate, ComicVineClient, ComicVineIssueCandidate, ComicVineSearchResult
-from .mangabaka import DEFAULT_API_BASE_URL, MangaBakaCandidate, MangaBakaClient, MangaBakaNextReleaseCandidate, MangaBakaSearchResult
-from .manga_news import DEFAULT_MANGA_NEWS_API_BASE_URL, MangaNewsCandidate, MangaNewsClient, MangaNewsNextReleaseCandidate, MangaNewsSearchResult, MangaNewsVolumeCandidate, series_slug_from_manga_news_url
+from .metron import DEFAULT_METRON_API_BASE_URL, MetronCandidate, MetronClient, MetronSearchResult
+from .mangabaka import (
+    DEFAULT_API_BASE_URL,
+    MANGABAKA_AUTOMATCH_MIN_MARGIN,
+    MangaBakaCandidate,
+    MangaBakaClient,
+    MangaBakaNextReleaseCandidate,
+    MangaBakaSearchResult,
+    mangabaka_match_score,
+    mangabaka_search_title,
+    ranked_mangabaka_choices,
+    select_mangabaka_automatch,
+)
+from .mangacollec import MangaCollecStore
+from .nautiljon import (
+    NautiljonCandidate,
+    NautiljonCsvClient,
+    NautiljonSearchResult,
+    clean_nautiljon_query,
+    merge_nautiljon_links,
+    merge_nautiljon_tags,
+    select_nautiljon_automatch,
+)
+from .manga_news import DEFAULT_MANGA_NEWS_API_BASE_URL, MangaNewsCandidate, MangaNewsClient, MangaNewsNextReleaseCandidate, MangaNewsSearchResult, MangaNewsVolumeCandidate, manga_news_edition_label_from_url, merge_manga_news_edition_links, series_slug_from_manga_news_url, split_manga_news_edition_title
 from .app_settings import AppConfig, DEFAULT_CONFIG_FILE, MatchingConfig, load_config, save_config
 from .kora.local_exclusions import LocalExclusionsStore
 from .csv_tools import (
@@ -73,11 +98,33 @@ from .csv_tools import (
     read_csv,
     write_csv,
 )
+from .cover_search import DuckDuckGoCoverSearchClient, cover_search_query, download_cover_image
+from .chapter_cleanup import (
+    analyze_chapter_series_item,
+    is_series_enrichment_source,
+    preserve_chapter_series_title_suffix,
+    scan_chapter_series,
+)
+from .author_cleanup import (
+    AuthorCanonicalStore,
+    analyze_book_author_change,
+    author_decision_is_remembered,
+    author_mapping_for_group,
+    load_cached_author_references,
+    scan_author_groups,
+)
+from .language_cleanup import (
+    CANONICAL_SOURCES as LANGUAGE_CLEANUP_SOURCES,
+    is_chapter_series_title,
+    normalize_language as normalize_cleanup_language,
+    scan_language_cleanup,
+)
 from .external_rate_limit import ExternalSourceBlocked, RateLimitedSourceClient
 from .enrichment_history import EnrichmentHistoryStore, format_search_timestamp
 from .metadata_quality import (
     SUMMARY_MIN_SIGNIFICANT_CHARS as QUALITY_SUMMARY_MIN_SIGNIFICANT_CHARS,
     bedetheque_main_album_count as quality_bedetheque_main_album_count,
+    build_conservative_search_queries,
     build_search_queries,
     clean_title_for_compare,
     clean_title_for_search,
@@ -97,8 +144,13 @@ from .metadata_quality import (
     should_auto_apply_changed_metadata_field as quality_should_auto_apply_changed_metadata_field,
     significant_summary_length as quality_significant_summary_length,
 )
+from .metadata_cleanup import (
+    analyze_alternate_titles,
+    analyze_series_entity_alternate_titles,
+    scan_series_alternate_titles,
+)
 from .runtime import SecretRedactor
-from .source_books import SourceBookRow, match_source_books
+from .source_books import SourceBookRow, match_source_books, resolved_book_volume_number
 from .book_explorer import (
     BOOK_SOURCE_LABELS,
     DEFAULT_BOOK_ENRICHMENT_FIELDS,
@@ -111,11 +163,12 @@ from .book_explorer import (
 )
 
 APP_TITLE = "Komga DB Tool"
-APP_VERSION = "3.12.0rc3"
+APP_VERSION = "3.12.0rc24"
 MIN_TABLE_VISIBLE_ROWS = 5
 NEXT_RELEASE_TAG_PREFIX = "nextrelease:"
 
 SERIES_STATUS_VALUES = ("ONGOING", "ENDED", "HIATUS", "ABANDONED")
+CANONICAL_SOURCE_LINK_LABELS = ("MangaBaka", "ComicVine", "Metron", "Bedetheque", "Nautiljon", "Manga News")
 READING_DIRECTION_VALUES = ("LEFT_TO_RIGHT", "RIGHT_TO_LEFT", "VERTICAL", "WEBTOON")
 AUTHOR_ROLE_VALUES = (
     "writer",
@@ -858,7 +911,7 @@ def candidate_with_linked_title_sort(
     candidate: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Keep titleSort aligned when a source proposes a changed title."""
-    prepared = dict(candidate or {})
+    prepared = preserve_chapter_series_title_suffix(current, candidate)
     title = prepared.get("title")
     if (
         not is_blank_metadata_value(title)
@@ -910,12 +963,18 @@ def normalized_language_code(value: Any) -> str:
         "eng": "en",
         "english": "en",
         "anglais": "en",
+        "jp": "ja",
+        "jpn": "ja",
+        "japanese": "ja",
+        "japonais": "ja",
     }
     text = aliases.get(text, text)
     if text.startswith("fr-"):
         return "fr"
     if text.startswith("en-"):
         return "en"
+    if text.startswith("ja-"):
+        return "ja"
     return text
 
 
@@ -937,6 +996,8 @@ def metadata_status_matches(value: Any, expected: str) -> bool:
         return True
     if expected == "VIDE":
         return is_blank_metadata_value(value)
+    if expected == "NOT_ENDED":
+        return normalized_status_code(value) not in {"ENDED", "ABANDONED"}
     return normalized_status_code(value) == expected
 
 
@@ -1396,15 +1457,42 @@ class MainWindow(QMainWindow):
         self.operation_history: List[Dict[str, Any]] = []
         self._operation_sequence = 0
         self.audit_rows: List[Dict[str, Any]] = []
+        self.cleanup_rows: List[Dict[str, Any]] = []
+        self.chapter_cleanup_rows: List[Dict[str, Any]] = []
+        self.author_cleanup_rows: List[Dict[str, Any]] = []
+        self.language_cleanup_rows: List[Dict[str, Any]] = []
+        self.language_cleanup_checked_ids: set[str] = set()
+        self.language_cleanup_proposals: Dict[str, str] = {}
+        self.language_cleanup_range_anchor = ""
+        self._language_cleanup_refreshing = False
+        self.author_cleanup_book_changes: List[Dict[str, Any]] = []
+        self.author_cleanup_preview_mappings: Dict[str, Any] = {}
+        self.author_cleanup_preview_pending_decisions: List[tuple[Dict[str, Any], Any]] = []
+        self.author_cleanup_preview_ready = False
+        self.author_cleanup_checked: set[str] = set()
+        self.author_cleanup_canonicals: Dict[str, str] = {}
+        self.author_cleanup_replacements: Dict[str, List[str]] = {}
+        self._author_cleanup_refreshing = False
         self._external_rate_limit_state: Dict[str, Dict[str, Any]] = {
-            "bedetheque": {"next_allowed": 0.0, "lock": threading.Lock()},
             "mangabaka": {"next_allowed": 0.0, "lock": threading.Lock()},
             "manga_news": {"next_allowed": 0.0, "lock": threading.Lock()},
             "comicvine": {"next_allowed": 0.0, "lock": threading.Lock()},
+            "metron": {"next_allowed": 0.0, "lock": threading.Lock()},
         }
         self._diagnostic_lock = threading.Lock()
         self._diagnostic_counter = 0
         self.diagnostic_log_path = os.path.join(self.backup.session_dir, "audit", "diagnostic_requests.jsonl")
+        self._series_query_cache: Dict[tuple[int, str, str, str, str], tuple[float, List[Any]]] = {}
+        self._series_query_cache_lock = threading.Lock()
+        self._series_query_inflight: Dict[tuple[int, str, str, str, str], threading.Event] = {}
+        self._series_query_cache_epoch = 0
+        self._book_query_cache: Dict[tuple[int, str, str, str, str], tuple[float, List[Any]]] = {}
+        self._book_query_cache_lock = threading.Lock()
+        self._book_query_inflight: Dict[tuple[int, str, str, str, str], threading.Event] = {}
+        self._book_query_cache_epoch = 0
+        self._poster_thumbnail_cache: Dict[tuple[str, str], bytes] = {}
+        self._poster_thumbnail_cache_lock = threading.Lock()
+        self._poster_thumbnail_generation: Dict[str, int] = {"series": 0, "book": 0}
 
         self.libraries: List[Any] = []
         self.library_combos: Dict[str, QComboBox] = {}
@@ -1446,8 +1534,16 @@ class MainWindow(QMainWindow):
         # Les recherches/scrapes en retard ne doivent jamais réécrire le diff
         # d'une autre série quand on avance vite dans la file.
         self.bdt_context_generation: int = 0
+        self.nautiljon_results: List[NautiljonSearchResult] = []
+        self.nautiljon_candidate: Optional[NautiljonCandidate] = None
+        self.naut_komga_series_rows: List[Any] = []
+        self.nautiljon_automatch_rows: List[Dict[str, Any]] = []
+        self.nautiljon_pending_series_id: str = ""
+        self.nautiljon_automatch_mode = False
+        self.nautiljon_context_generation: int = 0
         self.mangabaka_results: List[MangaBakaSearchResult] = []
         self.mangabaka_candidate: Optional[MangaBakaCandidate] = None
+        self.mbk_automatch_mode = False
         self.mbk_komga_series_rows: List[Any] = []
         self.mbk_komga_book_rows: List[Any] = []
         self.mbk_context_generation: int = 0
@@ -1470,10 +1566,19 @@ class MainWindow(QMainWindow):
         self.cv_issue_candidates_by_id: Dict[str, ComicVineIssueCandidate] = {}
         self.cv_book_matches: List[Dict[str, Any]] = []
         self.cv_context_generation: int = 0
+        self.metron_results: List[MetronSearchResult] = []
+        self.metron_candidate: Optional[MetronCandidate] = None
+        self.metron_komga_series_rows: List[Any] = []
+        self.metron_context_generation: int = 0
         self.current_metadata: Dict[str, Any] = {}
         self._metadata_preview_signature: Optional[str] = None
         self.local_exclusions = LocalExclusionsStore()
         self.enrichment_history = EnrichmentHistoryStore()
+        self.author_canonical_store = AuthorCanonicalStore()
+        self.mangacollec_store = MangaCollecStore(Path(".komga_db_tool_cache") / "mangacollec")
+        self.mangacollec_match_rows: List[Dict[str, Any]] = []
+        self.mangacollec_match_all_rows: List[Dict[str, Any]] = []
+        self.mangacollec_komga_rows: List[Any] = []
         self.meta_target_rows: List[Any] = []
         self._registered_tables: Dict[str, QTableWidget] = {}
         self._table_default_hidden: Dict[str, set[str]] = {}
@@ -1506,6 +1611,7 @@ class MainWindow(QMainWindow):
         # Async Komga series reload guard. A slower, older reload must never
         # overwrite a newer filtered table after a filter/source change.
         self._series_load_generation: Dict[str, int] = {}
+        self._metron_test_in_progress = False
 
         self._build_ui()
         self.auto_match_progress_signal.connect(self._set_auto_match_progress)
@@ -1517,7 +1623,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Generic helpers
     # ------------------------------------------------------------------
-    def run_worker(self, label: str, fn: Callable[[], Any], done: Optional[Callable[[Any], None]] = None) -> None:
+    def run_worker(
+        self,
+        label: str,
+        fn: Callable[[], Any],
+        done: Optional[Callable[[Any], None]] = None,
+        finished: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.log(f"▶ {label}")
         self._set_auto_match_progress(f"{label} — en cours", 0, 0)
         event_id = self._next_diagnostic_id(label)
@@ -1572,6 +1684,8 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(
             lambda worker=worker, task_id=event_id: self._on_worker_finished(worker, task_id)
         )
+        if finished is not None:
+            worker.signals.finished.connect(finished)
         self.thread_pool.start(worker)
 
     def _on_worker_finished(self, worker: Worker, task_id: str = "") -> None:
@@ -1717,7 +1831,7 @@ class MainWindow(QMainWindow):
 
     def _known_secrets(self) -> List[str]:
         values: List[str] = []
-        for name in ("api_key", "username", "password", "manga_news_token", "comicvine_api_key"):
+        for name in ("api_key", "username", "password", "manga_news_token", "comicvine_api_key", "metron_token"):
             widget = getattr(self, name, None)
             if widget is not None and hasattr(widget, "text"):
                 values.append(str(widget.text() or ""))
@@ -1818,6 +1932,161 @@ class MainWindow(QMainWindow):
     def komga_api(self) -> KomgaApi:
         return KomgaApi(self.komga_url.text().strip(), auth=self._auth_config(), timeout=self.timeout_seconds.value())
 
+    def _cached_series(
+        self,
+        library_id: Optional[str] = None,
+        search: str = "",
+        *,
+        page_size: int = 500,
+        max_age_seconds: float = 20.0,
+    ) -> List[Any]:
+        """Share short-lived Komga series reads between interactive screens."""
+        # During startup, restoring combo/filter values can emit signals before
+        # credentials and libraries are ready.  Those requests used to load all
+        # libraries and could later overwrite a properly filtered table.
+        if not getattr(self, "_komga_connection_validated", False) or not getattr(self, "libraries", []):
+            return []
+        key = (
+            int(self._series_query_cache_epoch),
+            self.komga_url.text().strip(),
+            self.auth_mode.currentText(),
+            str(library_id or ""),
+            str(search or "").strip().casefold(),
+        )
+        now = time.monotonic()
+        while True:
+            with self._series_query_cache_lock:
+                cached = self._series_query_cache.get(key)
+                if cached and now - cached[0] <= max(1.0, float(max_age_seconds)):
+                    return list(cached[1])
+                pending = self._series_query_inflight.get(key)
+                if pending is None:
+                    pending = threading.Event()
+                    self._series_query_inflight[key] = pending
+                    owns_request = True
+                else:
+                    owns_request = False
+            if owns_request:
+                break
+            pending.wait()
+            now = time.monotonic()
+
+        try:
+            rows = self.komga_api().series(library_id, search=search, page_size=max(200, int(page_size)))
+            if library_id:
+                received_count = len(rows)
+                rows = [row for row in rows if str(getattr(row, "library_id", "") or "") == str(library_id)]
+                if len(rows) != received_count:
+                    self._write_diagnostic_event({
+                        "event": "library_scope_guard",
+                        "target": "series",
+                        "library_id": str(library_id),
+                        "received": received_count,
+                        "kept": len(rows),
+                    })
+        except Exception:
+            with self._series_query_cache_lock:
+                self._series_query_inflight.pop(key, None)
+                pending.set()
+            raise
+        with self._series_query_cache_lock:
+            self._series_query_cache[key] = (time.monotonic(), list(rows))
+            self._series_query_inflight.pop(key, None)
+            pending.set()
+            if len(self._series_query_cache) > 24:
+                oldest = min(self._series_query_cache, key=lambda item: self._series_query_cache[item][0])
+                self._series_query_cache.pop(oldest, None)
+            return list(rows)
+
+    def _invalidate_series_cache(self) -> None:
+        with self._series_query_cache_lock:
+            self._series_query_cache_epoch += 1
+            self._series_query_cache.clear()
+
+    def _cached_books(
+        self,
+        library_id: Optional[str],
+        series_id: Optional[str],
+        *,
+        search: str = "",
+        page_size: int = 500,
+        direct_series_only: bool = False,
+        timeout: Optional[int] = None,
+        max_age_seconds: float = 20.0,
+    ) -> List[Any]:
+        if not series_id:
+            return self.komga_api().books(
+                library_id,
+                None,
+                search=search,
+                page_size=page_size,
+                direct_series_only=direct_series_only,
+                timeout=timeout,
+            )
+        key = (
+            int(self._book_query_cache_epoch),
+            self.komga_url.text().strip(),
+            str(library_id or ""),
+            str(series_id),
+            str(search or "").strip().casefold(),
+        )
+        now = time.monotonic()
+        while True:
+            with self._book_query_cache_lock:
+                cached = self._book_query_cache.get(key)
+                if cached and now - cached[0] <= max(1.0, float(max_age_seconds)):
+                    return list(cached[1])
+                pending = self._book_query_inflight.get(key)
+                if pending is None:
+                    pending = threading.Event()
+                    self._book_query_inflight[key] = pending
+                    owns_request = True
+                else:
+                    owns_request = False
+            if owns_request:
+                break
+            pending.wait()
+            now = time.monotonic()
+
+        try:
+            rows = self.komga_api().books(
+                library_id,
+                series_id,
+                search=search,
+                page_size=page_size,
+                direct_series_only=direct_series_only,
+                timeout=timeout,
+            )
+            if library_id:
+                received_count = len(rows)
+                rows = [row for row in rows if str(getattr(row, "library_id", "") or "") == str(library_id)]
+                if len(rows) != received_count:
+                    self._write_diagnostic_event({
+                        "event": "library_scope_guard",
+                        "target": "books",
+                        "library_id": str(library_id),
+                        "received": received_count,
+                        "kept": len(rows),
+                    })
+        except Exception:
+            with self._book_query_cache_lock:
+                self._book_query_inflight.pop(key, None)
+                pending.set()
+            raise
+        with self._book_query_cache_lock:
+            self._book_query_cache[key] = (time.monotonic(), list(rows))
+            self._book_query_inflight.pop(key, None)
+            pending.set()
+            if len(self._book_query_cache) > 48:
+                oldest = min(self._book_query_cache, key=lambda item: self._book_query_cache[item][0])
+                self._book_query_cache.pop(oldest, None)
+            return list(rows)
+
+    def _invalidate_book_cache(self) -> None:
+        with self._book_query_cache_lock:
+            self._book_query_cache_epoch += 1
+            self._book_query_cache.clear()
+
     def _komga_credentials_missing_reason(self) -> str:
         if not self.komga_url.text().strip():
             return "URL Komga absente"
@@ -1867,10 +2136,11 @@ class MainWindow(QMainWindow):
             self.auto_match_progress_signal.emit,
         )
 
-    def bedetheque_client(self) -> Any:
-        if hasattr(self, "bdt_csv_only") and self.bdt_csv_only.isChecked():
-            return BedethequeCsvClient(self.bdt_csv_path.text().strip())
-        return self._external_rate_limited_client("bedetheque", BedethequeClient(timeout=self.timeout_seconds.value()))
+    def bedetheque_client(self) -> BedethequeCsvClient:
+        return BedethequeCsvClient(self.bdt_csv_path.text().strip())
+
+    def nautiljon_client(self) -> NautiljonCsvClient:
+        return NautiljonCsvClient(self.nautiljon_csv_path.text().strip())
 
     def mangabaka_client(self) -> RateLimitedSourceClient:
         client = MangaBakaClient(
@@ -1901,6 +2171,16 @@ class MainWindow(QMainWindow):
             cache_dir=self.comicvine_cache_dir.text().strip() or ".komga_db_tool_cache/comicvine",
         )
         return self._external_rate_limited_client("comicvine", client)
+
+    def metron_client(self) -> RateLimitedSourceClient:
+        client = MetronClient(
+            base_url=self.metron_base_url.text().strip() or DEFAULT_METRON_API_BASE_URL,
+            token=self.metron_token.text().strip(),
+            timeout=self.metron_timeout_seconds.value(),
+            cache_enabled=self.metron_cache_enabled.isChecked(),
+            cache_dir=self.metron_cache_dir.text().strip() or ".komga_db_tool_cache/metron",
+        )
+        return self._external_rate_limited_client("metron", client)
 
     def simulation_enabled(self) -> bool:
         return self.simulation_check.isChecked()
@@ -1934,17 +2214,11 @@ class MainWindow(QMainWindow):
         if combo is None:
             return
         previous = combo.currentData() or "ALL"
-        labels: List[str] = []
-        for row in rows:
-            metadata = getattr(row, "metadata", {}) or {}
-            labels.extend(metadata_link_labels(metadata.get("links")))
-        labels = sorted(_dedupe_link_labels(labels), key=lambda value: normalized_link_label(value))
-
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("Tous", "ALL")
         combo.addItem("Sans lien", "__NO_LINK__")
-        for label in labels:
+        for label in CANONICAL_SOURCE_LINK_LABELS:
             combo.addItem(label, label)
         idx = combo.findData(previous)
         if idx < 0 and previous not in {"ALL", "__NO_LINK__"}:
@@ -1960,17 +2234,11 @@ class MainWindow(QMainWindow):
         if combo is None:
             return
         previous = combo.currentData() or "ALL"
-        labels: List[str] = []
-        for row in rows:
-            metadata = getattr(row, "metadata", {}) or {}
-            labels.extend(metadata_link_labels(metadata.get("links")))
-        labels = sorted(_dedupe_link_labels(labels), key=lambda value: normalized_link_label(value))
-
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("Tous", "ALL")
         combo.addItem("Sans lien", "__NO_LINK__")
-        for label in labels:
+        for label in CANONICAL_SOURCE_LINK_LABELS:
             combo.addItem(label, label)
         idx = combo.findData(previous)
         if idx < 0 and previous not in {"ALL", "__NO_LINK__"}:
@@ -1986,14 +2254,7 @@ class MainWindow(QMainWindow):
         if combo is None:
             return
         previous = combo.currentData() or "ALL"
-        labels: List[str] = []
         fixed = _dedupe_link_labels(list(fixed_labels or []))
-        fixed_norms = {normalized_link_label(label) for label in fixed}
-        for row in rows or []:
-            metadata = getattr(row, "metadata", {}) or {}
-            labels.extend(metadata_link_labels(metadata.get("links")))
-        labels = [label for label in labels if normalized_link_label(label) not in fixed_norms]
-        labels = sorted(_dedupe_link_labels(labels), key=lambda value: normalized_link_label(value))
 
         combo.blockSignals(True)
         combo.clear()
@@ -2003,9 +2264,7 @@ class MainWindow(QMainWindow):
             value = without_link_label_filter_value(label)
             if value:
                 combo.addItem(f"SANS {label}", value)
-        for label in fixed:
-            combo.addItem(str(label), str(label))
-        for label in labels:
+        for label in CANONICAL_SOURCE_LINK_LABELS:
             combo.addItem(label, label)
         idx = combo.findData(previous)
         if idx < 0 and previous not in {"ALL", "__NO_LINK__"}:
@@ -2028,16 +2287,20 @@ class MainWindow(QMainWindow):
         row.setSpacing(6)
         empty_summary = QCheckBox("Résumé vide")
         empty_summary.setToolTip("Afficher uniquement les séries dont le résumé est vide")
+        hide_chapters = QCheckBox("Masquer les séries (Chap)")
+        hide_chapters.setToolTip("Masquer les séries dont le titre se termine par (Chap) ou (Chapitre)")
         language = QComboBox()
         language.setMinimumWidth(80)
         language.setToolTip("Filtrer les séries affichées selon metadata.language")
         language.addItem("Toutes", "")
         language.addItem("FR", "fr")
         language.addItem("EN", "en")
+        language.addItem("JA", "ja")
         status = QComboBox()
         status.setMinimumWidth(105)
         status.setToolTip("Filtrer les séries affichées selon metadata.status")
         status.addItem("Tous", "ALL")
+        status.addItem("Tout non terminé", "NOT_ENDED")
         for value in SERIES_STATUS_VALUES:
             status.addItem(value, value)
         status.addItem("VIDE", "VIDE")
@@ -2050,7 +2313,8 @@ class MainWindow(QMainWindow):
             without_value = without_link_label_filter_value(label)
             if without_value:
                 link_label.addItem(f"SANS {label}", without_value)
-            link_label.addItem(str(label), str(label))
+        for label in CANONICAL_SOURCE_LINK_LABELS:
+            link_label.addItem(label, label)
         recent_search = QComboBox()
         recent_search.setMinimumWidth(190)
         recent_search.setToolTip("Masquer les séries déjà recherchées récemment avec cette source")
@@ -2067,6 +2331,7 @@ class MainWindow(QMainWindow):
         recent_search_all.addItem("Exclure recherchées < 30 j", 30)
 
         setattr(self, f"{prefix}_filter_empty_summary", empty_summary)
+        setattr(self, f"{prefix}_filter_hide_chapters", hide_chapters)
         setattr(self, f"{prefix}_filter_language", language)
         setattr(self, f"{prefix}_filter_status", status)
         setattr(self, f"{prefix}_filter_link_label", link_label)
@@ -2078,6 +2343,7 @@ class MainWindow(QMainWindow):
 
         row.addWidget(QLabel("Filtres"))
         row.addWidget(empty_summary)
+        row.addWidget(hide_chapters)
         row.addWidget(QLabel("Langue"))
         row.addWidget(language)
         row.addWidget(QLabel("Statut"))
@@ -2091,6 +2357,7 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
 
         empty_summary.stateChanged.connect(lambda *_: self._on_source_series_filter_changed(prefix, reload_fn))
+        hide_chapters.stateChanged.connect(lambda *_: self._on_source_series_filter_changed(prefix, reload_fn))
         language.currentIndexChanged.connect(lambda *_: self._on_source_series_filter_changed(prefix, reload_fn))
         status.currentIndexChanged.connect(lambda *_: self._on_source_series_filter_changed(prefix, reload_fn))
         link_label.currentIndexChanged.connect(lambda *_: self._on_source_series_filter_changed(prefix, reload_fn))
@@ -2111,9 +2378,16 @@ class MainWindow(QMainWindow):
                 "name": "Bedetheque",
                 "selection": QAbstractItemView.ExtendedSelection,
             },
+            "naut": {
+                "table": "naut_komga_series_table",
+                "rows": "naut_komga_series_rows",
+                "name": "Nautiljon",
+                "selection": QAbstractItemView.ExtendedSelection if self.nautiljon_automatch_mode else QAbstractItemView.SingleSelection,
+            },
             "mbk": {"table": "mbk_komga_series_table", "rows": "mbk_komga_series_rows", "name": "MangaBaka"},
             "mn": {"table": "mn_komga_series_table", "rows": "mn_komga_series_rows", "name": "Manga News"},
             "cv": {"table": "cv_komga_series_table", "rows": "cv_komga_series_rows", "name": "ComicVine"},
+            "metron": {"table": "metron_komga_series_table", "rows": "metron_komga_series_rows", "name": "Metron"},
         }.get(prefix, {})
 
     def _display_source_series_rows(self, prefix: str, rows: List[Any], *, log_result: bool = True) -> None:
@@ -2145,6 +2419,7 @@ class MainWindow(QMainWindow):
     def _apply_source_series_filters(self, prefix: str, rows: List[Any]) -> tuple[List[Any], List[str]]:
         rows = list(rows or [])
         empty_summary = getattr(self, f"{prefix}_filter_empty_summary", None)
+        hide_chapters = getattr(self, f"{prefix}_filter_hide_chapters", None)
         language_combo = getattr(self, f"{prefix}_filter_language", None)
         status_combo = getattr(self, f"{prefix}_filter_status", None)
         link_combo = getattr(self, f"{prefix}_filter_link_label", None)
@@ -2160,6 +2435,17 @@ class MainWindow(QMainWindow):
         if empty_summary is not None and empty_summary.isChecked():
             rows = [x for x in rows if is_blank_metadata_value((getattr(x, "metadata", {}) or {}).get("summary"))]
             active_filters.append("summary vide")
+        if hide_chapters is not None and hide_chapters.isChecked():
+            rows = [
+                x
+                for x in rows
+                if not re.search(
+                    r"\(\s*chap(?:itre)?s?\s*\)\s*$",
+                    str(getattr(x, "title", "") or ""),
+                    flags=re.IGNORECASE,
+                )
+            ]
+            active_filters.append("séries (Chap) masquées")
         if language_filter:
             rows = [x for x in rows if metadata_language_matches((getattr(x, "metadata", {}) or {}).get("language"), language_filter)]
             active_filters.append(f"langue={str(language_filter).upper()}")
@@ -2195,7 +2481,7 @@ class MainWindow(QMainWindow):
         return rows, active_filters
 
     def _enrichment_source_for_prefix(self, prefix: str) -> str:
-        return {"bdt": "bedetheque", "mbk": "mangabaka", "mn": "manga_news", "cv": "comicvine"}.get(prefix, prefix)
+        return {"bdt": "bedetheque", "naut": "nautiljon", "mbk": "mangabaka", "mn": "manga_news", "cv": "comicvine", "metron": "metron"}.get(prefix, prefix)
 
     def _series_table_rows_for_source(self, prefix: str, rows: List[Any]) -> List[List[Any]]:
         series_ids = [getattr(x, "id", "") for x in rows]
@@ -2216,9 +2502,11 @@ class MainWindow(QMainWindow):
     def _series_title_for_enrichment_id(self, prefix: str, series_id: str) -> str:
         attribute = {
             "bdt": "bdt_komga_series_rows",
+            "naut": "naut_komga_series_rows",
             "mbk": "mbk_komga_series_rows",
             "mn": "mn_komga_series_rows",
             "cv": "cv_komga_series_rows",
+            "metron": "metron_komga_series_rows",
         }.get(prefix)
         for row in getattr(self, attribute, []) if attribute else []:
             if str(getattr(row, "id", "")) == str(series_id or ""):
@@ -2237,9 +2525,11 @@ class MainWindow(QMainWindow):
         )
         mappings = {
             "bdt": ("bdt_komga_series_table", "bdt_komga_series_rows"),
+            "naut": ("naut_komga_series_table", "naut_komga_series_rows"),
             "mbk": ("mbk_komga_series_table", "mbk_komga_series_rows"),
             "mn": ("mn_komga_series_table", "mn_komga_series_rows"),
             "cv": ("cv_komga_series_table", "cv_komga_series_rows"),
+            "metron": ("metron_komga_series_table", "metron_komga_series_rows"),
         }
         display = format_search_timestamp(timestamp)
         for candidate_prefix, (table_attribute, rows_attribute) in mappings.items():
@@ -2306,14 +2596,43 @@ class MainWindow(QMainWindow):
     def _is_current_series_load_generation(self, key: str, generation: int) -> bool:
         return int(self._series_load_generation.get(key, 0)) == int(generation)
 
+    def _invalidate_all_series_load_generations(self) -> None:
+        """Make every series result started with an older library list stale."""
+        for key in tuple(self._series_load_generation):
+            self._series_load_generation[key] = int(self._series_load_generation.get(key, 0)) + 1
+
+    def _clear_source_series_for_library_change(self, combo_name: str) -> None:
+        """Never leave rows from the previous library visible during a reload."""
+        prefix = {
+            "bedetheque": "bdt",
+            "nautiljon": "naut",
+            "mangabaka": "mbk",
+            "manga_news": "mn",
+            "comicvine": "cv",
+            "metron": "metron",
+        }.get(combo_name)
+        if not prefix:
+            return
+        self._source_series_unfiltered_rows.pop(prefix, None)
+        config = self._source_series_view_config(prefix)
+        rows_attribute = str(config.get("rows", ""))
+        if rows_attribute:
+            setattr(self, rows_attribute, [])
+        table = getattr(self, str(config.get("table", "")), None)
+        if table is not None:
+            table.clearSelection()
+            table.setRowCount(0)
+
     def _reload_series_views_after_visibility_change(self) -> None:
         for loader_name in (
             "load_series",
             "load_metadata_targets",
             "load_bedetheque_komga_series",
+            "load_nautiljon_komga_series",
             "load_mangabaka_komga_series",
             "load_manga_news_komga_series",
             "load_comicvine_komga_series",
+            "load_metron_komga_series",
             "load_release_tracking_series",
         ):
             loader = getattr(self, loader_name, None)
@@ -2354,6 +2673,7 @@ class MainWindow(QMainWindow):
             self._active_context_series_id = ""
             self._active_context_book_title = ""
             self._active_context_book_id = ""
+        self._clear_source_series_for_library_change(_name)
         self._active_context_library_id = library_id
         self._active_context_library_name = library_name
         self._refresh_context_header()
@@ -2571,6 +2891,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda t=table: self._fill_table_to_viewport(t))
 
     def _fill_table_to_viewport(self, table: QTableWidget) -> None:
+        if bool(table.property("komgaDisableViewportFill")):
+            return
         if table.columnCount() <= 0 or table.viewport().width() <= 0:
             return
         visible = [column for column in range(table.columnCount()) if not table.isColumnHidden(column)]
@@ -2596,6 +2918,22 @@ class MainWindow(QMainWindow):
             self._restoring_table_ui_state = False
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        language_table = getattr(self, "language_cleanup_table", None)
+        if (
+            language_table is not None
+            and watched is language_table.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.LeftButton
+        ):
+            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            index = language_table.indexAt(point)
+            if index.isValid() and index.column() == 0:
+                self._toggle_language_cleanup_range(
+                    index.row(),
+                    shift=bool(event.modifiers() & Qt.ShiftModifier),
+                )
+                language_table.setCurrentCell(index.row(), 0)
+                return True
         if event.type() == QEvent.Resize:
             table = self._table_viewports.get(id(watched))
             if table is not None:
@@ -2772,6 +3110,7 @@ class MainWindow(QMainWindow):
             )
         for prefix, table_name, rows_name in (
             ("bdt", "bdt_komga_series_table", "bdt_komga_series_rows"),
+            ("naut", "naut_komga_series_table", "naut_komga_series_rows"),
             ("mbk", "mbk_komga_series_table", "mbk_komga_series_rows"),
             ("mn", "mn_komga_series_table", "mn_komga_series_rows"),
             ("cv", "cv_komga_series_table", "cv_komga_series_rows"),
@@ -2784,7 +3123,7 @@ class MainWindow(QMainWindow):
                     self._series_table_headers(include_history=True),
                     self._series_table_rows_for_source(prefix, rows),
                     stretch_from=1,
-                    selection_mode=QAbstractItemView.ExtendedSelection if prefix == "bdt" else None,
+                    selection_mode=QAbstractItemView.ExtendedSelection if prefix in {"bdt", "naut"} else None,
                 )
         if hasattr(self, "rt_series_table"):
             self._set_table(
@@ -3533,32 +3872,38 @@ class MainWindow(QMainWindow):
         row_data: Optional[List[Any]] = None,
     ) -> None:
         sorting_enabled = table.isSortingEnabled()
-        if sorting_enabled:
-            table.setSortingEnabled(False)
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setRowCount(len(rows))
-        table.setWordWrap(False)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(selection_mode if selection_mode is not None else QAbstractItemView.SingleSelection)
-        for r, row in enumerate(rows):
-            for c, value in enumerate(row):
-                item = QTableWidgetItem("" if value is None else str(value))
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                item.setToolTip("" if value is None else str(value))
-                if c == 0 and row_data is not None and r < len(row_data):
-                    item.setData(Qt.UserRole, row_data[r])
-                table.setItem(r, c, item)
-        if sorting_enabled:
-            table.setSortingEnabled(True)
-        if headers:
-            table.resizeColumnsToContents()
-            self._configure_resizable_table(table, stretch_from=stretch_from)
-        if table not in {
-            getattr(self, "series_table", None),
-            getattr(self, "book_explorer_table", None),
-        }:
-            self._ensure_generic_table_context_menu(table)
+        table.setUpdatesEnabled(False)
+        try:
+            if sorting_enabled:
+                table.setSortingEnabled(False)
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setRowCount(len(rows))
+            table.setWordWrap(False)
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setSelectionMode(selection_mode if selection_mode is not None else QAbstractItemView.SingleSelection)
+            for r, row in enumerate(rows):
+                for c, value in enumerate(row):
+                    item = QTableWidgetItem("" if value is None else str(value))
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    item.setToolTip("" if value is None else str(value))
+                    if c == 0 and row_data is not None and r < len(row_data):
+                        item.setData(Qt.UserRole, row_data[r])
+                    table.setItem(r, c, item)
+            if sorting_enabled:
+                table.setSortingEnabled(True)
+            if headers:
+                table.horizontalHeader().setResizeContentsPrecision(min(100, max(10, len(rows))))
+                table.resizeColumnsToContents()
+                self._configure_resizable_table(table, stretch_from=stretch_from)
+            if table not in {
+                getattr(self, "series_table", None),
+                getattr(self, "book_explorer_table", None),
+            }:
+                self._ensure_generic_table_context_menu(table)
+        finally:
+            table.setUpdatesEnabled(True)
+            table.viewport().update()
 
     def _set_detail_table(self, table: QTableWidget, data: Dict[str, Any]) -> None:
         rows: List[List[Any]] = []
@@ -3688,6 +4033,12 @@ class MainWindow(QMainWindow):
             current_blank = is_blank_metadata_value(current_value)
             identical = one_line(current_value) == one_line(new_value)
             merged_adds = isinstance(new_value, list) and one_line(new_value) != one_line(current_value) and has_candidate
+            language_repair = bool(
+                field == "language"
+                and has_candidate
+                and auto_include_allowed
+                and not quality_is_supported_write_language(current_value)
+            )
             # Règle métier validée : STATUS Bedetheque remplace automatiquement
             # un status Komga non vide quand il est différent (ex: ONGOING -> ENDED).
             critical_change = should_auto_apply_changed_metadata_field(field, "series") and has_candidate and not identical
@@ -3695,7 +4046,7 @@ class MainWindow(QMainWindow):
                 has_candidate
                 and auto_include_allowed
                 and not identical
-                and (critical_change or current_blank or merged_adds)
+                and (critical_change or current_blank or merged_adds or language_repair)
             )
 
             field_item = QTableWidgetItem(metadata_field_label(field))
@@ -3715,7 +4066,7 @@ class MainWindow(QMainWindow):
                 field_item.setToolTip(reason)
                 new_item.setToolTip(f"{reason}\n\n{one_line(new_value)}")
             if field == "language" and has_candidate and not auto_include_allowed:
-                reason = "Language non inclus : seules les valeurs fr/en sont autorisées en écriture automatique."
+                reason = "Language non inclus : code absent de la liste BCP-47 autorisée pour les sources fiables."
                 field_item.setToolTip(reason)
                 new_item.setToolTip(f"{reason}\n\n{one_line(new_value)}")
 
@@ -3860,7 +4211,12 @@ class MainWindow(QMainWindow):
             current_blank = is_blank_metadata_value(current_value)
             merged_adds = isinstance(new_value, list) and one_line(new_value) != one_line(current_value)
             critical_change = critical_changes and should_auto_apply_changed_metadata_field(field, target_type)
-            checked_by_default = bool(critical_change or current_blank or merged_adds)
+            language_repair = bool(
+                field == "language"
+                and should_auto_include_metadata_field(field, candidate_value)
+                and not quality_is_supported_write_language(current_value)
+            )
+            checked_by_default = bool(critical_change or current_blank or merged_adds or language_repair)
             if checked_by_default and new_value != "":
                 normalized = normalize_metadata_payload_value(field, new_value)
                 if normalized != "":
@@ -3874,6 +4230,7 @@ class MainWindow(QMainWindow):
         *,
         allow_all_languages: bool = False,
         preserve_empty_strings: bool = False,
+        normalize_known_authors: bool = True,
     ) -> Dict[str, Any]:
         """Final guard before PATCH.
 
@@ -3887,6 +4244,8 @@ class MainWindow(QMainWindow):
                 continue
             if field == "language" and allow_all_languages:
                 clean_value = normalize_bcp47_tag(value) if value is not None else None
+            elif field == "authors" and normalize_known_authors:
+                clean_value = self.author_canonical_store.normalize_entries(value)
             else:
                 clean_value = normalize_metadata_payload_value(field, value)
             if clean_value != "" or (preserve_empty_strings and value == ""):
@@ -3918,13 +4277,17 @@ class MainWindow(QMainWindow):
         this method so payload normalization, audit JSON and rollback snapshots
         cannot diverge again.
         """
+        current_metadata = current or {}
+        guarded_payload = payload
+        if target_type == "series" and is_series_enrichment_source(source):
+            guarded_payload = preserve_chapter_series_title_suffix(current_metadata, payload)
         normalized_payload = self._normalize_payload_for_target(
             target_type,
-            payload,
+            guarded_payload,
             allow_all_languages=allow_all_languages,
             preserve_empty_strings=preserve_empty_strings,
+            normalize_known_authors=not source.startswith("cleanup_authors"),
         )
-        current_metadata = current or {}
         audit_base = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "source": source,
@@ -4121,9 +4484,11 @@ class MainWindow(QMainWindow):
         sources_grid = QGridLayout()
         sources = [
             ("Bedetheque", "BD franco-belge : résumé, statut, liens et correspondance des tomes."),
+            ("Nautiljon", "CSV local : genres et thèmes ajoutés aux tags Komga existants."),
             ("MangaBaka", "Mangas : métadonnées de série, tomes et liens existants."),
             ("Manga News", "Mangas : résumés, volumes et prochaines parutions."),
             ("ComicVine", "Comics : volumes, numéros, métadonnées et couvertures."),
+            ("Metron", "Comics : métadonnées de série et référentiel éditorial via l’API Metron."),
         ]
         for position, (source, description) in enumerate(sources):
             box = QGroupBox(source)
@@ -4206,9 +4571,9 @@ class MainWindow(QMainWindow):
             ("ORGANISER", ["Collections", "Readlists", "Genres Kora"]),
             (
                 "ENRICHIR ET SUIVRE",
-                ["Enrichissement", "Bedetheque", "MangaBaka", "Manga News", "ComicVine", "Prochaines sorties", "Suivi sorties"],
+                ["Enrichissement", "Bedetheque", "Nautiljon", "MangaBaka", "Manga News", "ComicVine", "Metron", "Prochaines sorties", "Suivi sorties"],
             ),
-            ("CONTRÔLER ET RÉPARER", ["Santé", "Audit", "CSV / Bulk", "Opérations", "Rollback", "Outils", "Logs / Backups"]),
+            ("CONTRÔLER ET RÉPARER", ["Santé", "Audit", "Nettoyage", "CSV / Bulk", "Opérations", "Rollback", "Outils", "Logs / Backups"]),
             ("RÉGLAGES", ["Connexion", "Paramètres"]),
         ]
         self.navigation_list.clear()
@@ -4345,12 +4710,15 @@ class MainWindow(QMainWindow):
         self._build_posters_tab()
         self._build_csv_tab()
         self._build_bedetheque_tab()
+        self._build_nautiljon_tab()
         self._build_mangabaka_tab()
         self._build_manga_news_tab()
         self._build_next_releases_tab()
         self._build_comicvine_tab()
+        self._build_metron_tab()
         self._build_health_tab()
         self._build_audit_tab()
+        self._build_cleanup_tab()
         self._build_release_tracking_tab()
         self._build_operations_tab()
         self._build_rollback_tab()
@@ -4707,6 +5075,25 @@ class MainWindow(QMainWindow):
         cvf.addRow("", self.comicvine_cache_enabled)
         cvf.addRow("Dossier cache", self.comicvine_cache_dir)
         services_panel_layout.addWidget(comicvine_box)
+
+        metron_box = QGroupBox("Connexion Metron")
+        mtf = QFormLayout(metron_box)
+        self.metron_base_url = QLineEdit()
+        self.metron_enabled = QCheckBox("Activer module Metron")
+        self.metron_timeout_seconds = QSpinBox()
+        self.metron_timeout_seconds.setRange(1, 600)
+        self.metron_token = QLineEdit()
+        self.metron_token.setEchoMode(QLineEdit.Password)
+        self.metron_token.setPlaceholderText("Laisser vide conserve le jeton déjà enregistré")
+        self.metron_cache_enabled = QCheckBox("Cache local recherches/lookups")
+        self.metron_cache_dir = QLineEdit()
+        mtf.addRow("URL API Metron", self.metron_base_url)
+        mtf.addRow("", self.metron_enabled)
+        mtf.addRow("Timeout", self.metron_timeout_seconds)
+        mtf.addRow("Bearer token", self.metron_token)
+        mtf.addRow("", self.metron_cache_enabled)
+        mtf.addRow("Dossier cache", self.metron_cache_dir)
+        services_panel_layout.addWidget(metron_box)
         services_panel_layout.addStretch(1)
 
         options_box = QGroupBox("Options")
@@ -4727,6 +5114,7 @@ class MainWindow(QMainWindow):
         btn_test_mangabaka = QPushButton("Tester MangaBaka")
         btn_test_manga_news = QPushButton("Tester Manga News")
         btn_test_comicvine = QPushButton("Tester ComicVine")
+        btn_test_metron = QPushButton("Tester Metron")
         btn_load_libs = QPushButton("Charger bibliothèques partout")
         btn_open_backup = QPushButton("Ouvrir backups")
         actions.addWidget(btn_save, 0, 0)
@@ -4736,6 +5124,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(btn_test_mangabaka, 1, 0)
         actions.addWidget(btn_test_manga_news, 1, 1)
         actions.addWidget(btn_test_comicvine, 1, 2)
+        actions.addWidget(btn_test_metron, 1, 3)
         layout.addLayout(actions)
 
         btn_save.clicked.connect(self.save_config_action)
@@ -4743,6 +5132,7 @@ class MainWindow(QMainWindow):
         btn_test_mangabaka.clicked.connect(self.test_mangabaka)
         btn_test_manga_news.clicked.connect(self.test_manga_news)
         btn_test_comicvine.clicked.connect(self.test_comicvine)
+        btn_test_metron.clicked.connect(self.test_metron)
         btn_load_libs.clicked.connect(self.load_libraries)
         btn_open_backup.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.backup.session_dir)))
         self.diagnostic_requests_enabled.stateChanged.connect(
@@ -4920,10 +5310,12 @@ class MainWindow(QMainWindow):
         self.filter_series_language.addItem("Toutes", "")
         self.filter_series_language.addItem("FR", "fr")
         self.filter_series_language.addItem("EN", "en")
+        self.filter_series_language.addItem("JA", "ja")
         self.filter_series_status = QComboBox()
         self.filter_series_status.setMinimumWidth(105)
         self.filter_series_status.setToolTip("Filtrer les séries affichées selon metadata.status")
         self.filter_series_status.addItem("Tous", "ALL")
+        self.filter_series_status.addItem("Tout non terminé", "NOT_ENDED")
         for status in SERIES_STATUS_VALUES:
             self.filter_series_status.addItem(status, status)
         self.filter_series_status.addItem("VIDE", "VIDE")
@@ -4932,6 +5324,8 @@ class MainWindow(QMainWindow):
         self.filter_series_link_label.setToolTip("Filtrer les séries selon leurs liens externes")
         self.filter_series_link_label.addItem("Tous", "ALL")
         self.filter_series_link_label.addItem("Sans lien", "__NO_LINK__")
+        for label in CANONICAL_SOURCE_LINK_LABELS:
+            self.filter_series_link_label.addItem(label, label)
         btn_load_libs = QPushButton("Actualiser les bibliothèques")
         btn_load_series = QPushButton("Actualiser les séries")
         btn_load_books = QPushButton("Actualiser les tomes")
@@ -5150,8 +5544,10 @@ class MainWindow(QMainWindow):
         self.book_explorer_language_filter.addItem("Toutes", "")
         self.book_explorer_language_filter.addItem("FR", "fr")
         self.book_explorer_language_filter.addItem("EN", "en")
+        self.book_explorer_language_filter.addItem("JA", "ja")
         self.book_explorer_status_filter = QComboBox()
         self.book_explorer_status_filter.addItem("Tous", "ALL")
+        self.book_explorer_status_filter.addItem("Tout non terminé", "NOT_ENDED")
         for status in SERIES_STATUS_VALUES:
             self.book_explorer_status_filter.addItem(status, status)
         self.book_explorer_source_filter = QComboBox()
@@ -5167,6 +5563,8 @@ class MainWindow(QMainWindow):
             ("Sans ComicVine", "without:comicvine"),
             ("Avec MangaBaka", "with:mangabaka"),
             ("Sans MangaBaka", "without:mangabaka"),
+            ("Avec Nautiljon", "with:nautiljon"),
+            ("Sans Nautiljon", "without:nautiljon"),
         ):
             self.book_explorer_source_filter.addItem(label, value)
         self.book_explorer_missing_filter = QComboBox()
@@ -5184,6 +5582,10 @@ class MainWindow(QMainWindow):
         self.book_explorer_empty_summary_filter = QCheckBox("Résumé vide")
         self.book_explorer_empty_summary_filter.setToolTip(
             "Afficher uniquement les tomes dont le champ summary est vide."
+        )
+        self.book_explorer_hide_chapters_filter = QCheckBox("Masquer les séries (Chap)")
+        self.book_explorer_hide_chapters_filter.setToolTip(
+            "Exclure de la liste tous les tomes appartenant à une série dont le titre se termine par (Chap)."
         )
         self.book_explorer_sort = QComboBox()
         for label, value in (
@@ -5220,6 +5622,7 @@ class MainWindow(QMainWindow):
         filters.addWidget(self.book_explorer_sort, 2, 5)
         filters.addWidget(self.book_explorer_order, 2, 6)
         filters.addWidget(self.book_explorer_empty_summary_filter, 3, 0, 1, 2)
+        filters.addWidget(self.book_explorer_hide_chapters_filter, 3, 2, 1, 2)
         filters.setColumnStretch(3, 1)
         layout.addWidget(filters_box)
 
@@ -5292,6 +5695,9 @@ class MainWindow(QMainWindow):
         self.book_explorer_empty_summary_filter.stateChanged.connect(
             lambda *_: self.apply_book_explorer_filters()
         )
+        self.book_explorer_hide_chapters_filter.stateChanged.connect(
+            lambda *_: self.apply_book_explorer_filters()
+        )
         self.book_explorer_table.itemSelectionChanged.connect(self.on_book_explorer_selected)
         self.book_explorer_table.customContextMenuRequested.connect(self.show_book_explorer_context_menu)
         self.book_explorer_analyze_button.clicked.connect(self.analyze_book_explorer_selection)
@@ -5300,6 +5706,7 @@ class MainWindow(QMainWindow):
     def reset_book_explorer_filters(self) -> None:
         self.book_explorer_search.clear()
         self.book_explorer_empty_summary_filter.setChecked(False)
+        self.book_explorer_hide_chapters_filter.setChecked(False)
         for combo in (
             self.book_explorer_added_filter,
             self.book_explorer_language_filter,
@@ -5399,6 +5806,7 @@ class MainWindow(QMainWindow):
             source_filter=str(self.book_explorer_source_filter.currentData() or "all"),
             missing_field=str(self.book_explorer_missing_filter.currentData() or ""),
             empty_summary=self.book_explorer_empty_summary_filter.isChecked(),
+            hide_chapter_series=self.book_explorer_hide_chapters_filter.isChecked(),
         )
         rows = sort_book_rows(
             rows,
@@ -5636,9 +6044,10 @@ class MainWindow(QMainWindow):
         source_url: str,
     ) -> List[Dict[str, Any]]:
         client = self.manga_news_client()
-        slug, _url = self._manga_news_link_for_series(series)
+        slug, linked_url = self._manga_news_link_for_series(series)
         if not slug:
             slug = extract_manga_news_series_slug_from_url(source_url)
+        edition_label = manga_news_edition_label_from_url(linked_url or source_url)
         if not slug:
             return [
                 self._new_book_explorer_analysis_row(
@@ -5653,11 +6062,25 @@ class MainWindow(QMainWindow):
         results: List[Dict[str, Any]] = []
         for row in rows:
             try:
-                candidate = client.get_volume_by_number(slug, row.get("number", ""))
-                exact = bool(
-                    normalize_volume_number(row.get("number", ""))
-                    and normalize_volume_number(row.get("number", "")) == normalize_volume_number(candidate.number)
+                requested_number = resolved_book_volume_number(
+                    row.get("number", ""),
+                    row.get("title", ""),
+                    row.get("series_title", ""),
                 )
+                if requested_number:
+                    candidate = client.get_volume_by_number(
+                        slug,
+                        requested_number,
+                        edition_label=edition_label,
+                    )
+                    exact = requested_number == normalize_volume_number(candidate.number)
+                else:
+                    candidate = client.get_volume_without_number(
+                        slug,
+                        row.get("title", "") or row.get("series_title", ""),
+                        edition_label=edition_label,
+                    )
+                    exact = True
                 results.append(
                     self._new_book_explorer_analysis_row(
                         row,
@@ -5686,75 +6109,19 @@ class MainWindow(QMainWindow):
         rows: List[Dict[str, Any]],
         source_url: str,
     ) -> List[Dict[str, Any]]:
-        client = self.bedetheque_client()
-        try:
-            series_candidate = client.scrape_series(source_url)
-            albums = list((series_candidate.raw or {}).get("albums") or [])
-        except Exception as exc:
-            return [
-                self._new_book_explorer_analysis_row(
-                    row,
-                    source="bedetheque",
-                    source_ref=source_url,
-                    status="Erreur de chargement Bedetheque",
-                    error=str(exc),
-                )
-                for row in rows
-            ]
-        source_rows = [
-            SourceBookRow(
-                id=str(album.get("url") or index),
-                number=str(album.get("number") or ""),
-                title=str(album.get("title") or ""),
-                url=str(album.get("url") or ""),
-                raw=album,
+        return [
+            self._new_book_explorer_analysis_row(
+                row,
+                source="bedetheque",
+                source_ref=source_url,
+                status="Métadonnées par tome indisponibles",
+                error=(
+                    "Le CSV Bedetheque contient uniquement des données de série. "
+                    "Aucune connexion au site ne sera effectuée."
+                ),
             )
-            for index, album in enumerate(albums)
+            for row in rows
         ]
-        books = [row.get("book") for row in rows]
-        matches = match_source_books(books, source_rows)[: len(rows)]
-        results: List[Dict[str, Any]] = []
-        for row, match in zip(rows, matches):
-            source_index = int(match.get("source_index", -1))
-            if source_index < 0 or source_index >= len(source_rows):
-                results.append(
-                    self._new_book_explorer_analysis_row(
-                        row,
-                        source="bedetheque",
-                        source_ref=source_url,
-                        status="Aucun album correspondant",
-                    )
-                )
-                continue
-            source_row = source_rows[source_index]
-            exact = str(match.get("confidence") or "").casefold().startswith("exact")
-            try:
-                candidate = client.scrape_album(source_row.url)
-                results.append(
-                    self._new_book_explorer_analysis_row(
-                        row,
-                        source="bedetheque",
-                        source_ref=candidate.source_url,
-                        matched_title=candidate.album_title or source_row.title,
-                        confidence="high" if exact else "ambiguous",
-                        score=float(match.get("score") or 0.0),
-                        candidate=candidate.book_metadata,
-                    )
-                )
-            except Exception as exc:
-                results.append(
-                    self._new_book_explorer_analysis_row(
-                        row,
-                        source="bedetheque",
-                        source_ref=source_row.url,
-                        matched_title=source_row.title,
-                        confidence="high" if exact else "ambiguous",
-                        score=float(match.get("score") or 0.0),
-                        status="Erreur de chargement album",
-                        error=str(exc),
-                    )
-                )
-        return results
 
     def _analyze_comicvine_books(
         self,
@@ -5799,7 +6166,11 @@ class MainWindow(QMainWindow):
             )
             for issue in issues
         ]
-        matches = match_source_books([row.get("book") for row in rows], source_rows)[: len(rows)]
+        matches = match_source_books(
+            [row.get("book") for row in rows],
+            source_rows,
+            series_title=str(rows[0].get("series_title") or "") if rows else "",
+        )[: len(rows)]
         results: List[Dict[str, Any]] = []
         for row, match in zip(rows, matches):
             source_index = int(match.get("source_index", -1))
@@ -6992,70 +7363,181 @@ class MainWindow(QMainWindow):
         self.poster_tab = tab
         layout = QVBoxLayout(tab)
         intro = QLabel(
-            "Choisissez une cible, vérifiez ses couvertures existantes, puis ajoutez ou sélectionnez une image. "
-            "Le mode simulation bloque tous les uploads."
+            "Recherchez directement une série ou un tome, puis gérez ses couvertures. "
+            "Les identifiants Komga restent internes ; une sélection de l'Explorateur peut toujours préremplir cet écran."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
-        target_box = QGroupBox("1. Choisir la cible")
-        form = QGridLayout(target_box)
-        self.poster_library_combo = self._make_library_combo("posters")
+
         self.poster_type = QComboBox()
-        self.poster_type.addItems(["series", "book", "collection", "readlist"])
+        self.poster_type.addItems(["series", "book"])
         self.poster_id = QLineEdit()
-        self.poster_url = QLineEdit()
-        self.poster_url.setPlaceholderText("URL image optionnelle")
-        btn_use_selection = QPushButton("Utiliser sélection")
-        btn_show_current = QPushButton("Voir couverture")
-        btn_list = QPushButton("Lister posters")
-        btn_add_local = QPushButton("Ajouter image locale")
-        btn_add_url = QPushButton("Ajouter depuis URL")
-        self.poster_select_id = QLineEdit()
-        self.poster_select_id.setPlaceholderText("thumbnailId à sélectionner")
-        btn_select = QPushButton("Marquer sélectionné")
-        form.addWidget(QLabel("Bibliothèque"), 0, 0)
-        form.addWidget(self.poster_library_combo, 0, 1)
-        form.addWidget(QLabel("Type"), 0, 2)
-        form.addWidget(self.poster_type, 0, 3)
-        form.addWidget(QLabel("ID"), 0, 4)
-        form.addWidget(self.poster_id, 0, 5)
-        form.addWidget(btn_use_selection, 0, 6)
-        layout.addWidget(target_box)
+        self.poster_type.hide()
+        self.poster_id.hide()
+        self.poster_target_title = ""
+        self.poster_series_rows: List[Any] = []
+        self.poster_book_rows: List[Any] = []
+        self.poster_selected_series: Any = None
+        self.poster_selected_book: Any = None
+        self.poster_series_page = 0
+        self.poster_series_total_pages = 0
+        self.poster_book_page = 0
+        self.poster_book_total_pages = 0
 
-        actions_box = QGroupBox("2. Vérifier ou ajouter une couverture")
-        actions = QGridLayout(actions_box)
-        actions.addWidget(btn_show_current, 0, 0)
-        actions.addWidget(btn_list, 0, 1)
-        actions.addWidget(btn_add_local, 0, 2)
-        actions.addWidget(self.poster_url, 1, 0, 1, 2)
-        actions.addWidget(btn_add_url, 1, 2)
-        layout.addWidget(actions_box)
-
-        select_box = QGroupBox("3. Sélectionner une couverture existante")
-        select_layout = QHBoxLayout(select_box)
-        select_layout.addWidget(self.poster_select_id, 1)
-        select_layout.addWidget(btn_select)
-        layout.addWidget(select_box)
-        self.poster_status_label = QLabel("Aucune cible active.")
-        self.poster_status_label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self.poster_status_label)
         split = QSplitter(Qt.Horizontal)
+        target_box = QGroupBox("Choisir la cible")
+        target_layout = QVBoxLayout(target_box)
+        self.poster_target_tabs = QTabWidget()
+
+        series_tab = QWidget()
+        series_layout = QVBoxLayout(series_tab)
+        series_controls = QHBoxLayout()
+        self.poster_series_library_combo = self._make_library_combo("poster_series")
+        self.poster_series_search = QLineEdit()
+        self.poster_series_search.setPlaceholderText("Rechercher une série par titre")
+        btn_search_series = QPushButton("Rechercher")
+        series_controls.addWidget(QLabel("Bibliothèque"))
+        series_controls.addWidget(self.poster_series_library_combo)
+        series_controls.addWidget(self.poster_series_search, 1)
+        series_controls.addWidget(btn_search_series)
+        series_layout.addLayout(series_controls)
+        self.poster_series_table = QTableWidget()
+        self._register_table(self.poster_series_table, "posters.series_targets")
+        series_layout.addWidget(self.poster_series_table, 1)
+        series_page_controls = QHBoxLayout()
+        self.poster_series_prev = QPushButton("Page précédente")
+        self.poster_series_next = QPushButton("Page suivante")
+        self.poster_series_page_label = QLabel("Page 1/1")
+        series_page_controls.addWidget(self.poster_series_prev)
+        series_page_controls.addWidget(self.poster_series_page_label, 1, Qt.AlignCenter)
+        series_page_controls.addWidget(self.poster_series_next)
+        series_layout.addLayout(series_page_controls)
+        self.poster_target_tabs.addTab(series_tab, "Séries")
+
+        books_tab = QWidget()
+        books_layout = QVBoxLayout(books_tab)
+        books_controls = QGridLayout()
+        self.poster_books_library_combo = self._make_library_combo("poster_books")
+        self.poster_book_search = QLineEdit()
+        self.poster_book_search.setPlaceholderText("Rechercher par série, numéro ou titre")
+        self.poster_book_series_filter = QComboBox()
+        self.poster_book_series_filter.addItem("Toutes les séries", "")
+        btn_search_books = QPushButton("Rechercher")
+        books_controls.addWidget(QLabel("Bibliothèque"), 0, 0)
+        books_controls.addWidget(self.poster_books_library_combo, 0, 1)
+        books_controls.addWidget(QLabel("Recherche"), 1, 0)
+        books_controls.addWidget(self.poster_book_search, 1, 1)
+        books_controls.addWidget(QLabel("Filtre série"), 2, 0)
+        books_controls.addWidget(self.poster_book_series_filter, 2, 1)
+        books_controls.addWidget(btn_search_books, 0, 2, 3, 1)
+        books_layout.addLayout(books_controls)
+        self.poster_books_table = QTableWidget()
+        self._register_table(self.poster_books_table, "posters.book_targets")
+        books_layout.addWidget(self.poster_books_table, 1)
+        page_controls = QHBoxLayout()
+        self.poster_book_prev = QPushButton("Page précédente")
+        self.poster_book_next = QPushButton("Page suivante")
+        self.poster_book_page_label = QLabel("Page 1/1")
+        page_controls.addWidget(self.poster_book_prev)
+        page_controls.addWidget(self.poster_book_page_label, 1, Qt.AlignCenter)
+        page_controls.addWidget(self.poster_book_next)
+        books_layout.addLayout(page_controls)
+        self.poster_target_tabs.addTab(books_tab, "Tomes")
+        target_layout.addWidget(self.poster_target_tabs, 1)
+        split.addWidget(target_box)
+
+        treatment_box = QGroupBox("Traitement de la couverture")
+        treatment = QVBoxLayout(treatment_box)
+        self.poster_status_label = QLabel("Aucune cible active.")
+        self.poster_status_label.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.poster_status_label.setWordWrap(True)
+        treatment.addWidget(self.poster_status_label)
+        self.poster_preview = QLabel("Sélectionnez une série ou un tome")
+        self.poster_preview.setAlignment(Qt.AlignCenter)
+        self.poster_preview.setMinimumHeight(280)
+        treatment.addWidget(self.poster_preview)
+
+        actions = QGridLayout()
+        btn_list = QPushButton("Actualiser les couvertures")
+        btn_add_local = QPushButton("Ajouter une image locale")
+        self.poster_url = QLineEdit()
+        self.poster_url.setPlaceholderText("https://…")
+        btn_add_url = QPushButton("Ajouter depuis URL")
+        actions.addWidget(btn_list, 0, 0)
+        actions.addWidget(btn_add_local, 0, 1)
+        actions.addWidget(QLabel("URL image"), 1, 0)
+        actions.addWidget(self.poster_url, 1, 1)
+        actions.addWidget(btn_add_url, 1, 2)
+        treatment.addLayout(actions)
+
+        online_search = QGroupBox("Recherche intégrée de couvertures")
+        online_layout = QVBoxLayout(online_search)
+        self.poster_search_query_label = QLabel("Disponible après sélection d'un tome.")
+        self.poster_search_query_label.setWordWrap(True)
+        online_layout.addWidget(self.poster_search_query_label)
+        self.poster_search_button = QPushButton("Rechercher des couvertures")
+        online_layout.addWidget(self.poster_search_button)
+        self.poster_search_table = QTableWidget()
+        self._register_table(self.poster_search_table, "posters.online_search")
+        self.poster_search_table.setMinimumHeight(230)
+        online_layout.addWidget(self.poster_search_table)
+        self.poster_search_selection_label = QLabel("Aucune couverture sélectionnée.")
+        self.poster_search_selection_label.setWordWrap(True)
+        online_layout.addWidget(self.poster_search_selection_label)
+        self.poster_search_apply = QPushButton("Ajouter et définir comme couverture")
+        self.poster_search_apply.setEnabled(False)
+        self.poster_search_apply.setToolTip("Sélectionnez une couverture dans les résultats.")
+        online_layout.addWidget(self.poster_search_apply)
+        treatment.addWidget(online_search)
+        self.poster_search_rows: List[Dict[str, Any]] = []
         self.poster_table = QTableWidget()
         self._register_table(self.poster_table, "posters.list", default_hidden=["ID"])
-        self.poster_preview = QLabel("Aucune couverture")
-        self.poster_preview.setAlignment(Qt.AlignCenter)
-        split.addWidget(self.poster_table)
-        split.addWidget(self.poster_preview)
-        split.setSizes([1000, 350])
+        treatment.addWidget(self.poster_table, 1)
+        btn_select = QPushButton("Définir la couverture choisie")
+        treatment.addWidget(btn_select)
+        technical = QGroupBox("Détails techniques")
+        technical.setCheckable(True)
+        technical.setChecked(False)
+        technical_layout = QHBoxLayout(technical)
+        self.poster_technical_label = QLabel("Aucun ID")
+        self.poster_technical_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        btn_copy_id = QPushButton("Copier l'ID")
+        technical_layout.addWidget(self.poster_technical_label, 1)
+        technical_layout.addWidget(btn_copy_id)
+        treatment.addWidget(technical)
+        self.poster_select_id = QLineEdit()
+        self.poster_select_id.hide()
+        split.addWidget(treatment_box)
+        split.setSizes([950, 750])
         layout.addWidget(split, 1)
-        btn_use_selection.clicked.connect(self.use_selected_for_poster)
-        btn_show_current.clicked.connect(lambda: self._show_cover(self.poster_type.currentText(), self.poster_id.text().strip(), self.poster_preview))
+
+        btn_search_series.clicked.connect(lambda: self.load_poster_series_targets(0))
+        self.poster_series_search.returnPressed.connect(lambda: self.load_poster_series_targets(0))
+        self.poster_series_library_combo.currentIndexChanged.connect(lambda *_: self.load_poster_series_targets(0))
+        self.poster_series_table.itemSelectionChanged.connect(self.on_poster_series_target_selected)
+        self.poster_series_prev.clicked.connect(lambda: self.load_poster_series_targets(self.poster_series_page - 1))
+        self.poster_series_next.clicked.connect(lambda: self.load_poster_series_targets(self.poster_series_page + 1))
+        btn_search_books.clicked.connect(lambda: self.load_poster_book_targets(0))
+        self.poster_book_search.returnPressed.connect(lambda: self.load_poster_book_targets(0))
+        self.poster_books_library_combo.currentIndexChanged.connect(self.on_poster_books_library_changed)
+        self.poster_book_series_filter.currentIndexChanged.connect(lambda *_: self.load_poster_book_targets(0))
+        self.poster_books_table.itemSelectionChanged.connect(self.on_poster_book_target_selected)
+        self.poster_book_prev.clicked.connect(lambda: self.load_poster_book_targets(self.poster_book_page - 1))
+        self.poster_book_next.clicked.connect(lambda: self.load_poster_book_targets(self.poster_book_page + 1))
+        self.poster_target_tabs.currentChanged.connect(self.on_poster_target_tab_changed)
         btn_list.clicked.connect(self.list_posters)
         btn_add_local.clicked.connect(self.add_local_poster)
         btn_add_url.clicked.connect(self.add_url_poster)
         btn_select.clicked.connect(self.select_poster)
+        self.poster_search_button.clicked.connect(self.search_poster_covers)
+        self.poster_search_table.cellClicked.connect(self.select_poster_search_row)
+        self.poster_search_table.itemSelectionChanged.connect(self.on_poster_search_selection_changed)
+        self.poster_search_table.itemDoubleClicked.connect(lambda *_: self.apply_searched_poster())
+        self.poster_search_apply.clicked.connect(self.apply_searched_poster)
+        btn_copy_id.clicked.connect(lambda: QApplication.clipboard().setText(self.poster_id.text().strip()))
         self.poster_id.textChanged.connect(self._update_poster_status)
         self.poster_type.currentTextChanged.connect(self._update_poster_status)
+        self._update_poster_status()
         self._add_main_tab(tab, "Couvertures")
 
     def _build_csv_tab(self) -> None:
@@ -7175,19 +7657,17 @@ class MainWindow(QMainWindow):
         self._add_source_workflow_header(
             layout,
             "Bedetheque",
-            "Sélectionnez une série Komga, comparez la fiche et les albums Bedetheque, puis prévisualisez les champs retenus.",
+            "Sélectionnez une série Komga, chargez sa ligne depuis le CSV Bedetheque, puis prévisualisez les champs retenus. Aucune connexion au site n'est effectuée.",
         )
         scroll.setWidget(content)
         tab_layout.addWidget(scroll, 1)
 
         source_row = QHBoxLayout()
-        self.bdt_csv_only = QCheckBox("CSV uniquement (aucune recherche web)")
         self.bdt_csv_path = QLineEdit()
         self.bdt_csv_path.setPlaceholderText("Chemin vers bedetheque.csv")
         btn_browse_csv = QPushButton("Choisir CSV")
-        btn_test_source = QPushButton("Tester la source")
-        source_row.addWidget(QLabel("Source Bedetheque"))
-        source_row.addWidget(self.bdt_csv_only)
+        btn_test_source = QPushButton("Tester le CSV")
+        source_row.addWidget(QLabel("CSV Bedetheque — source unique"))
         source_row.addWidget(self.bdt_csv_path, 1)
         source_row.addWidget(btn_browse_csv)
         source_row.addWidget(btn_test_source)
@@ -7236,7 +7716,7 @@ class MainWindow(QMainWindow):
         self.bdt_query.setPlaceholderText("Recherche Bedetheque, ex: Thorgal")
         btn_from_komga = QPushButton("Titre Komga → recherche")
         btn_search = QPushButton("Rechercher")
-        btn_scrape_series = QPushButton("Scraper série sélectionnée")
+        btn_scrape_series = QPushButton("Charger la série depuis le CSV")
         search_row.addWidget(self.bdt_query, 3)
         search_row.addWidget(btn_from_komga)
         search_row.addWidget(btn_search)
@@ -7301,16 +7781,12 @@ class MainWindow(QMainWindow):
         books_box_layout.addWidget(self.bdt_komga_books_table, 1)
         books_top_split.addWidget(books_box)
 
-        albums_box = QGroupBox("Bedetheque — albums scrapés")
+        albums_box = QGroupBox("Bedetheque — métadonnées des tomes")
         albums_layout = QVBoxLayout(albums_box)
-        album_actions = QHBoxLayout()
-        btn_scrape_album = QPushButton("Scraper album sélectionné")
-        btn_scrape_all = QPushButton("Scraper tous albums")
-        album_actions.addWidget(btn_scrape_album)
-        album_actions.addWidget(btn_scrape_all)
-        album_actions.addStretch(1)
-        albums_layout.addLayout(album_actions)
-        self.bdt_albums_status = QLabel("")
+        self.bdt_albums_status = QLabel(
+            "Le CSV Bedetheque actuel ne contient pas de métadonnées par tome. "
+            "Aucun accès au site et aucun repli réseau ne seront tentés."
+        )
         self.bdt_albums_status.setWordWrap(True)
         albums_layout.addWidget(self.bdt_albums_status)
         self.bdt_albums_table = QTableWidget()
@@ -7404,7 +7880,6 @@ class MainWindow(QMainWindow):
 
         btn_load_komga.clicked.connect(self.load_bedetheque_komga_series)
         self.bdt_library_combo.currentIndexChanged.connect(lambda *_: self.load_bedetheque_komga_series())
-        self.bdt_csv_only.toggled.connect(self.on_bedetheque_source_changed)
         btn_browse_csv.clicked.connect(self.choose_bedetheque_csv)
         btn_test_source.clicked.connect(self.test_bedetheque_source)
         btn_queue_selected.clicked.connect(self.add_selected_bedetheque_series_to_queue)
@@ -7419,9 +7894,6 @@ class MainWindow(QMainWindow):
         self.bdt_results_table.itemDoubleClicked.connect(lambda *_: self.scrape_selected_bedetheque_series())
         btn_scrape_series.clicked.connect(self.scrape_selected_bedetheque_series)
         self.bdt_albums_table.itemSelectionChanged.connect(self.on_bedetheque_album_selected)
-        self.bdt_albums_table.itemDoubleClicked.connect(lambda *_: self.scrape_selected_bedetheque_album())
-        btn_scrape_album.clicked.connect(self.scrape_selected_bedetheque_album)
-        btn_scrape_all.clicked.connect(self.scrape_all_bedetheque_albums)
         btn_match.clicked.connect(self.match_bedetheque_tomes)
         self.bdt_match_table.itemSelectionChanged.connect(self.on_bedetheque_match_selected)
         btn_preview_series.clicked.connect(self.preview_bedetheque_series)
@@ -7443,17 +7915,786 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.bdt_csv_path.setText(path)
-            self.bdt_csv_only.setChecked(True)
-
-    def on_bedetheque_source_changed(self, *_: Any) -> None:
-        csv_mode = self.bdt_csv_only.isChecked()
-        self.bdt_csv_path.setEnabled(csv_mode)
 
     def test_bedetheque_source(self) -> None:
         self.run_worker(
             "Test source Bedetheque",
             lambda: self.bedetheque_client().test(),
             lambda result: self.log(f"✅ {result}"),
+        )
+
+    def _build_nautiljon_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self._add_source_workflow_header(
+            layout,
+            "Nautiljon",
+            "Source strictement locale : le CSV fournit les genres et thèmes à ajouter aux tags Komga. Les tags existants sont toujours conservés et aucun accès au site n'est effectué.",
+        )
+
+        csv_row = QHBoxLayout()
+        self.nautiljon_csv_path = QLineEdit()
+        self.nautiljon_csv_path.setPlaceholderText("Chemin vers nautiljon.csv")
+        btn_csv = QPushButton("Choisir CSV")
+        btn_test = QPushButton("Tester le CSV")
+        csv_row.addWidget(QLabel("CSV Nautiljon — source unique"))
+        csv_row.addWidget(self.nautiljon_csv_path, 1)
+        csv_row.addWidget(btn_csv)
+        csv_row.addWidget(btn_test)
+        layout.addLayout(csv_row)
+
+        controls = QHBoxLayout()
+        self.naut_library_combo = self._make_library_combo("nautiljon")
+        self.naut_komga_search = QLineEdit()
+        self.naut_komga_search.setPlaceholderText("Filtrer les séries Komga…")
+        btn_load = QPushButton("Charger séries Komga")
+        self.nautiljon_automatch_button = QPushButton("Automatch multiple")
+        self.nautiljon_automatch_button.setObjectName("nautiljon_automatch_button")
+        self.nautiljon_automatch_cancel_button = QPushButton("Annuler automatch")
+        self.nautiljon_automatch_cancel_button.setObjectName("nautiljon_automatch_cancel_button")
+        self.nautiljon_automatch_cancel_button.setVisible(False)
+        controls.addWidget(QLabel("Bibliothèque"))
+        controls.addWidget(self.naut_library_combo, 2)
+        controls.addWidget(self.naut_komga_search, 2)
+        controls.addWidget(btn_load)
+        controls.addWidget(self.nautiljon_automatch_button)
+        controls.addWidget(self.nautiljon_automatch_cancel_button)
+        layout.addLayout(controls)
+        layout.addLayout(self._make_source_series_filters_row("naut", self.load_nautiljon_komga_series, fixed_link_labels=["Nautiljon"]))
+
+        split = QSplitter(Qt.Horizontal)
+        komga_box = QGroupBox("Komga — séries (sélection multiple possible)")
+        komga_layout = QVBoxLayout(komga_box)
+        self.naut_komga_series_table = QTableWidget()
+        self._register_table(self.naut_komga_series_table, "nautiljon.komga_series", default_hidden=["ID"])
+        self._register_series_table_rows(self.naut_komga_series_table, "naut_komga_series_rows")
+        self.naut_komga_series_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.naut_komga_series_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        komga_layout.addWidget(self.naut_komga_series_table)
+        split.addWidget(komga_box)
+
+        source_box = QGroupBox("Nautiljon — recherche dans le CSV")
+        source_layout = QVBoxLayout(source_box)
+        search_row = QHBoxLayout()
+        self.nautiljon_query = QLineEdit()
+        self.nautiljon_query.setPlaceholderText("Titre à rechercher…")
+        btn_from_komga = QPushButton("Titre Komga → recherche")
+        btn_search = QPushButton("Rechercher")
+        btn_candidate = QPushButton("Charger le résultat")
+        search_row.addWidget(self.nautiljon_query, 2)
+        search_row.addWidget(btn_from_komga)
+        search_row.addWidget(btn_search)
+        search_row.addWidget(btn_candidate)
+        source_layout.addLayout(search_row)
+        self.nautiljon_results_table = QTableWidget()
+        self._register_table(self.nautiljon_results_table, "nautiljon.results", default_hidden=["URL"])
+        source_layout.addWidget(self.nautiljon_results_table)
+        split.addWidget(source_box)
+        split.setSizes([780, 850])
+        layout.addWidget(split, 2)
+
+        comparison = QGroupBox("Comparaison — uniquement Tags et lien Nautiljon")
+        comparison_layout = QVBoxLayout(comparison)
+        actions = QHBoxLayout()
+        btn_preview = QPushButton("Prévisualiser série")
+        btn_apply = QPushButton("Appliquer série")
+        actions.addWidget(btn_preview)
+        actions.addWidget(btn_apply)
+        actions.addStretch(1)
+        comparison_layout.addLayout(actions)
+        comparison_split = QSplitter(Qt.Vertical)
+        self.nautiljon_metadata_table = QTableWidget()
+        self._register_table(self.nautiljon_metadata_table, "nautiljon.series_diff")
+        self._init_metadata_table(self.nautiljon_metadata_table)
+        comparison_split.addWidget(self.nautiljon_metadata_table)
+        self.nautiljon_preview = QTextEdit()
+        self.nautiljon_preview.setReadOnly(True)
+        self.nautiljon_preview.setStyleSheet("font-family: monospace;")
+        comparison_split.addWidget(self.nautiljon_preview)
+        comparison_split.setSizes([220, 170])
+        comparison_layout.addWidget(comparison_split)
+        layout.addWidget(comparison, 1)
+
+        batch = QGroupBox("Automatch — résultats à valider")
+        batch_layout = QVBoxLayout(batch)
+        self.nautiljon_automatch_table = QTableWidget()
+        self._register_table(self.nautiljon_automatch_table, "nautiljon.automatch", default_hidden=["URL"])
+        batch_layout.addWidget(self.nautiljon_automatch_table)
+        batch_actions = QHBoxLayout()
+        btn_apply_batch = QPushButton("Valider et appliquer les lignes cochées")
+        btn_select_safe = QPushButton("Recocher les correspondances sûres")
+        batch_actions.addWidget(btn_apply_batch)
+        batch_actions.addWidget(btn_select_safe)
+        batch_actions.addStretch(1)
+        batch_layout.addLayout(batch_actions)
+        layout.addWidget(batch, 1)
+
+        btn_csv.clicked.connect(self.choose_nautiljon_csv)
+        btn_test.clicked.connect(self.test_nautiljon_source)
+        btn_load.clicked.connect(self.load_nautiljon_komga_series)
+        self.naut_library_combo.currentIndexChanged.connect(lambda *_: self.load_nautiljon_komga_series())
+        self.naut_komga_search.returnPressed.connect(self.load_nautiljon_komga_series)
+        self.naut_komga_series_table.itemSelectionChanged.connect(self.on_nautiljon_komga_series_selected)
+        btn_from_komga.clicked.connect(self.use_selected_for_nautiljon)
+        btn_search.clicked.connect(self.search_nautiljon)
+        self.nautiljon_query.returnPressed.connect(self.search_nautiljon)
+        btn_candidate.clicked.connect(self.load_selected_nautiljon_candidate)
+        self.nautiljon_results_table.itemDoubleClicked.connect(lambda *_: self.load_selected_nautiljon_candidate())
+        btn_preview.clicked.connect(self.preview_nautiljon_series)
+        btn_apply.clicked.connect(self.apply_nautiljon_series)
+        self.nautiljon_automatch_button.clicked.connect(self.toggle_nautiljon_automatch_mode)
+        self.nautiljon_automatch_cancel_button.clicked.connect(self.leave_nautiljon_automatch_mode)
+        btn_apply_batch.clicked.connect(self.apply_nautiljon_automatch)
+        btn_select_safe.clicked.connect(self.select_safe_nautiljon_automatch_rows)
+        self._add_main_tab(tab, "Nautiljon")
+
+    def choose_nautiljon_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choisir le CSV Nautiljon", self.nautiljon_csv_path.text().strip(), "CSV (*.csv);;Tous fichiers (*)"
+        )
+        if path:
+            self.nautiljon_csv_path.setText(path)
+
+    def test_nautiljon_source(self) -> None:
+        self.run_worker("Test source Nautiljon", lambda: self.nautiljon_client().test(), lambda result: self.log(f"✅ {result}"))
+
+    def _selected_nautiljon_automatch_series(self) -> List[Any]:
+        selection_model = self.naut_komga_series_table.selectionModel()
+        if selection_model is None:
+            return []
+        indexes = sorted({index.row() for index in selection_model.selectedRows()})
+        return [self.naut_komga_series_rows[index] for index in indexes if 0 <= index < len(self.naut_komga_series_rows)]
+
+    def _refresh_nautiljon_automatch_button(self) -> None:
+        if not self.nautiljon_automatch_mode:
+            self.nautiljon_automatch_button.setText("Automatch multiple")
+            self.nautiljon_automatch_button.setEnabled(True)
+            return
+        count = len(self._selected_nautiljon_automatch_series())
+        self.nautiljon_automatch_button.setText(f"Lancer l’automatch ({count})")
+        self.nautiljon_automatch_button.setEnabled(count > 0)
+
+    def enter_nautiljon_automatch_mode(self) -> None:
+        self.nautiljon_automatch_mode = True
+        self.nautiljon_context_generation += 1
+        self.naut_komga_series_table.blockSignals(True)
+        self.naut_komga_series_table.clearSelection()
+        self.naut_komga_series_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.naut_komga_series_table.blockSignals(False)
+        self.nautiljon_automatch_cancel_button.setVisible(True)
+        self._refresh_nautiljon_automatch_button()
+        QMessageBox.information(
+            self,
+            "Automatch Nautiljon — sélection multiple",
+            "Le mode Automatch est actif.\n\n"
+            "1. Sélectionnez les séries à analyser avec Ctrl ou Shift.\n"
+            "2. Le suffixe final (Chap) sera retiré uniquement pour la recherche.\n"
+            "3. Recliquez sur « Lancer l’automatch » pour générer le tableau de validation.\n"
+            "4. Vérifiez les lignes présélectionnées, puis appliquez-les avec le bouton sous le tableau.\n\n"
+            "Les tags Komga existants seront conservés et les doublons seront éliminés.",
+        )
+
+    def leave_nautiljon_automatch_mode(self) -> None:
+        self.nautiljon_automatch_mode = False
+        self.nautiljon_context_generation += 1
+        self.naut_komga_series_table.blockSignals(True)
+        self.naut_komga_series_table.clearSelection()
+        self.naut_komga_series_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.naut_komga_series_table.blockSignals(False)
+        self.nautiljon_automatch_cancel_button.setVisible(False)
+        self._refresh_nautiljon_automatch_button()
+
+    def toggle_nautiljon_automatch_mode(self) -> None:
+        if not self.nautiljon_automatch_mode:
+            self.enter_nautiljon_automatch_mode()
+            return
+        selected = self._selected_nautiljon_automatch_series()
+        if not selected:
+            QMessageBox.warning(self, "Automatch Nautiljon", "Sélectionnez au moins une série Komga.")
+            return
+        visible_limit = 24
+        titles = [str(getattr(series, "title", "") or "") for series in selected]
+        title_lines = "\n".join(f"• {title}" for title in titles[:visible_limit])
+        if len(titles) > visible_limit:
+            title_lines += f"\n… et {len(titles) - visible_limit} autre(s) série(s)."
+        answer = QMessageBox.question(
+            self,
+            "Confirmer la sélection Nautiljon",
+            f"{len(selected)} série(s) seront analysée(s) :\n\n{title_lines}\n\n"
+            "Cette liste correspond exactement aux lignes sélectionnées.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self.automatch_selected_nautiljon_series(selected)
+
+    def load_nautiljon_komga_series(self) -> None:
+        library_id = self._library_id("nautiljon")
+        search = self.naut_komga_search.text().strip()
+        generation = self._next_series_load_generation("nautiljon")
+
+        def done(rows: List[Any]) -> None:
+            if not self._is_current_series_load_generation("nautiljon", generation):
+                return
+            rows = self._filter_global_series_visibility(rows)
+            self._source_series_unfiltered_rows["naut"] = rows
+            self._refresh_source_link_filter_options("naut", rows)
+            rows, active_filters = self._apply_source_series_filters("naut", rows)
+            self.naut_komga_series_rows = rows
+            self._set_table(
+                self.naut_komga_series_table,
+                self._series_table_headers(include_history=True),
+                self._series_table_rows_for_source("naut", rows),
+                stretch_from=1,
+                selection_mode=QAbstractItemView.ExtendedSelection if self.nautiljon_automatch_mode else QAbstractItemView.SingleSelection,
+                row_data=rows,
+            )
+            suffix = f" — {', '.join(active_filters)}" if active_filters else ""
+            self.log(f"✅ Nautiljon : {len(rows)} séries Komga chargées{suffix}")
+            if self.nautiljon_pending_series_id:
+                target_id = self.nautiljon_pending_series_id
+                self.nautiljon_pending_series_id = ""
+                for index, series in enumerate(rows):
+                    if str(getattr(series, "id", "")) == target_id:
+                        self.naut_komga_series_table.selectRow(index)
+                        self.naut_komga_series_table.scrollToItem(self.naut_komga_series_table.item(index, 0))
+                        break
+
+        self.run_worker("Chargement séries Komga pour Nautiljon", lambda: self._cached_series(library_id, search=search), done)
+
+    def _current_nautiljon_series(self) -> Any:
+        row = self._selected_row_index(self.naut_komga_series_table)
+        return self.naut_komga_series_rows[row] if 0 <= row < len(self.naut_komga_series_rows) else None
+
+    def on_nautiljon_komga_series_selected(self) -> None:
+        if self.nautiljon_automatch_mode:
+            self._refresh_nautiljon_automatch_button()
+            return
+        series = self._current_nautiljon_series()
+        if series is None:
+            return
+        self.nautiljon_context_generation += 1
+        self._set_context_selection(series=series)
+        self.nautiljon_query.setText(clean_nautiljon_query(getattr(series, "title", "")))
+        self.nautiljon_candidate = None
+        self.nautiljon_metadata_table.setRowCount(0)
+        self.nautiljon_preview.setPlainText("Série sélectionnée. Recherche et prévisualisation Nautiljon en cours…")
+        self.search_nautiljon()
+
+    def use_selected_for_nautiljon(self) -> None:
+        series = self._current_nautiljon_series()
+        if series is not None:
+            self.nautiljon_query.setText(clean_nautiljon_query(getattr(series, "title", "")))
+
+    def search_nautiljon(self) -> None:
+        query = self.nautiljon_query.text().strip()
+        if not query:
+            QMessageBox.warning(self, "Nautiljon", "Saisissez un titre à rechercher.")
+            return
+        series = self._current_nautiljon_series()
+        target_series_id = str(getattr(series, "id", "") or "")
+        generation = self.nautiljon_context_generation
+        if series is not None:
+            self._record_enrichment_search("naut", str(series.id))
+
+        def done(rows: List[NautiljonSearchResult]) -> None:
+            current = self._current_nautiljon_series()
+            if target_series_id and (
+                generation != self.nautiljon_context_generation
+                or str(getattr(current, "id", "") or "") != target_series_id
+            ):
+                return
+            self.nautiljon_results = rows
+            self._set_table(
+                self.nautiljon_results_table,
+                ["Titre", "Score", "Titre alternatif", "Titre original", "Année", "Origine", "Type", "URL"],
+                [[row.title, f"{row.match_score:.3f}", row.alternate_title, row.original_title, row.year, row.origin, row.media_type, row.url] for row in rows],
+                stretch_from=0,
+                row_data=rows,
+            )
+            self._reset_table_to_first_row(self.nautiljon_results_table, select=True)
+            self.log(f"✅ Nautiljon : {len(rows)} résultat(s) CSV")
+            if rows and target_series_id:
+                self._load_nautiljon_candidate(rows[0], target_series_id, generation)
+            elif target_series_id:
+                self.nautiljon_preview.setPlainText("Aucun résultat Nautiljon trouvé pour cette série.")
+
+        self.run_worker("Recherche Nautiljon CSV", lambda: self.nautiljon_client().search(query), done)
+
+    def load_selected_nautiljon_candidate(self) -> None:
+        result = self._selected_row_data(self.nautiljon_results_table)
+        if result is None:
+            QMessageBox.warning(self, "Nautiljon", "Sélectionnez un résultat Nautiljon.")
+            return
+
+        series = self._current_nautiljon_series()
+        self._load_nautiljon_candidate(
+            result,
+            str(getattr(series, "id", "") or ""),
+            self.nautiljon_context_generation,
+        )
+
+    def _load_nautiljon_candidate(
+        self,
+        result: NautiljonSearchResult,
+        target_series_id: str,
+        generation: int,
+    ) -> None:
+        def done(candidate: NautiljonCandidate) -> None:
+            current = self._current_nautiljon_series()
+            if target_series_id and (
+                generation != self.nautiljon_context_generation
+                or str(getattr(current, "id", "") or "") != target_series_id
+            ):
+                return
+            self.nautiljon_candidate = candidate
+            self.preview_nautiljon_series()
+
+        self.run_worker("Chargement candidat Nautiljon", lambda: self.nautiljon_client().get_series(result.url), done)
+
+    def preview_nautiljon_series(self) -> None:
+        series = self._current_nautiljon_series()
+        candidate = self.nautiljon_candidate
+        if series is None or candidate is None:
+            self.nautiljon_preview.setPlainText("Sélectionnez une série Komga et chargez un résultat Nautiljon.")
+            return
+        target_series_id = str(series.id)
+        generation = self.nautiljon_context_generation
+
+        def done(current: Dict[str, Any]) -> None:
+            selected = self._current_nautiljon_series()
+            if (
+                generation != self.nautiljon_context_generation
+                or str(getattr(selected, "id", "") or "") != target_series_id
+            ):
+                return
+            proposed = {
+                "tags": merge_nautiljon_tags(current.get("tags"), candidate.series_metadata.get("tags") or []),
+                "links": merge_nautiljon_links(current.get("links"), candidate.source_url),
+            }
+            self._fill_series_preview_metadata_table(self.nautiljon_metadata_table, current, proposed)
+            payload = self._payload_from_metadata_table(self.nautiljon_metadata_table)
+            detail = self._format_diff(current, payload, f"PATCH /api/v1/series/{series.id}/metadata")
+            detail += "\n\nGenres CSV : " + "; ".join(candidate.raw.get("genres") or [])
+            detail += "\nThèmes CSV : " + "; ".join(candidate.raw.get("themes") or [])
+            self.nautiljon_preview.setPlainText(detail)
+
+        self.run_worker("Prévisualisation Nautiljon", lambda: self._fetch_current_series_preview_metadata(series.id), done)
+
+    def apply_nautiljon_series(self) -> None:
+        series = self._current_nautiljon_series()
+        payload = self._payload_from_metadata_table(self.nautiljon_metadata_table)
+        if series is None or not payload:
+            QMessageBox.warning(self, "Nautiljon", "Série Komga ou modification vide.")
+            return
+        if self.simulation_enabled():
+            self.preview_nautiljon_series()
+            self.log("Simulation active : aucune écriture Nautiljon")
+            return
+        if not self._confirm_source_write(source_name="Nautiljon", target_label=f"série {series.id}", field_count=len(payload)):
+            return
+
+        def work() -> Any:
+            api = self.komga_api()
+            current = self._fetch_current_metadata("series", series.id)
+            self.backup.save_json("operation", "series", series.id, {"current": current, "nautiljon": asdict(self.nautiljon_candidate) if self.nautiljon_candidate else {}, "payload": payload}, "avant PATCH Nautiljon série")
+            return self._write_metadata_update(api, "series", series.id, payload, current, source="nautiljon_manual", note="Application tags Nautiljon")
+
+        self.run_worker("Application Nautiljon série", work, lambda _result: self.log(f"✅ Tags Nautiljon appliqués sur série:{series.id}"))
+
+    def automatch_selected_nautiljon_series(self, selected: Optional[List[Any]] = None) -> None:
+        selected = list(selected or self._selected_nautiljon_automatch_series())
+        if not selected:
+            QMessageBox.warning(self, "Automatch Nautiljon", "Sélectionnez une ou plusieurs séries Komga.")
+            return
+
+        def work() -> List[Dict[str, Any]]:
+            client = self.nautiljon_client()
+            api = self.komga_api()
+            report: List[Dict[str, Any]] = []
+            for series in selected:
+                title = str(getattr(series, "title", "") or "")
+                self.enrichment_history.record_search("nautiljon", str(series.id), title)
+                query = clean_nautiljon_query(title)
+                row: Dict[str, Any] = {"series": series, "series_id": series.id, "komga_title": title, "query": query, "eligible": False, "status": "", "url": "", "matched_title": "", "score": 0.0, "second": 0.0, "tags": "", "error": "", "choices": [], "_current_metadata": {}}
+                try:
+                    search_results = client.search(query)
+                    row["choices"] = [asdict(result) for result in search_results[:5]]
+                    matched, status, best, second = select_nautiljon_automatch(search_results)
+                    row.update({"status": status, "score": best, "second": second})
+                    if search_results:
+                        row["_current_metadata"] = self._fetch_current_series_preview_metadata(series.id)
+                    if matched is not None:
+                        candidate = client.get_series(matched.url)
+                        current = row["_current_metadata"]
+                        proposed = {
+                            "tags": merge_nautiljon_tags(current.get("tags"), candidate.series_metadata.get("tags") or []),
+                            "links": merge_nautiljon_links(current.get("links"), candidate.source_url),
+                        }
+                        payload = self._payload_from_metadata_maps(current, proposed, ["tags", "links"], target_type="series")
+                        row.update({"matched_title": matched.title, "url": matched.url, "tags": "; ".join(candidate.series_metadata.get("tags") or []), "eligible": bool(payload), "status": "Prêt" if payload else "Aucun changement"})
+                except Exception as exc:
+                    row.update({"status": "Erreur", "error": str(exc)})
+                report.append(row)
+            return report
+
+        def done(rows: List[Dict[str, Any]]) -> None:
+            if self.nautiljon_automatch_mode:
+                self.leave_nautiljon_automatch_mode()
+            self.nautiljon_automatch_rows = rows
+            self._set_table(
+                self.nautiljon_automatch_table,
+                ["Appliquer", "Série Komga", "Recherche", "Match Nautiljon", "Score", "2e score", "Statut", "Tags proposés", "Erreur", "URL"],
+                [["", row["komga_title"], row["query"], row["matched_title"], f"{row['score']:.3f}", f"{row['second']:.3f}", row["status"], row["tags"], row["error"], row["url"]] for row in rows],
+                stretch_from=1,
+                selection_mode=QAbstractItemView.ExtendedSelection,
+            )
+            self.select_safe_nautiljon_automatch_rows()
+            self.log(f"✅ Nautiljon automatch : {sum(1 for row in rows if row['eligible'])}/{len(rows)} correspondance(s) prête(s)")
+            self._show_nautiljon_automatch_validation(rows)
+
+        self.run_worker("Automatch Nautiljon", work, done)
+
+    def _show_nautiljon_automatch_validation(self, rows: List[Dict[str, Any]]) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Automatch Nautiljon — validation des résultats")
+        dialog.resize(1480, 800)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(
+            "Les correspondances sûres qui ajoutent réellement des tags ou le lien Nautiljon sont cochées. "
+            "Décochez toute ligne douteuse avant de valider. Les tags Komga existants seront conservés et les doublons éliminés."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        filter_row = QHBoxLayout()
+        hide_no_change = QCheckBox('Masquer les statuts "Aucun changement"')
+        visible_count = QLabel("")
+        filter_row.addWidget(hide_no_change)
+        filter_row.addStretch(1)
+        filter_row.addWidget(visible_count)
+        layout.addLayout(filter_row)
+
+        table = QTableWidget()
+        headers = [
+            "Appliquer",
+            "Série Komga",
+            "Recherche",
+            "Match Nautiljon",
+            "Meilleur",
+            "Deuxième",
+            "Statut",
+            "Tags proposés",
+            "Erreur",
+        ]
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        for index, row in enumerate(rows):
+            check = QTableWidgetItem("")
+            check.setFlags((check.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            eligible = bool(row.get("eligible"))
+            check.setCheckState(Qt.Checked if eligible else Qt.Unchecked)
+            if not eligible:
+                check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+            table.setItem(index, 0, check)
+            values = [
+                row.get("komga_title", ""),
+                row.get("query", ""),
+                row.get("matched_title", ""),
+                f"{float(row.get('score') or 0):.3f}",
+                f"{float(row.get('second') or 0):.3f}",
+                row.get("status", ""),
+                row.get("tags", ""),
+                row.get("error", ""),
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setToolTip(str(value or ""))
+                table.setItem(index, column, item)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setColumnWidth(0, 80)
+        table.setColumnWidth(1, 300)
+        table.setColumnWidth(2, 240)
+        table.setColumnWidth(3, 300)
+        layout.addWidget(table, 1)
+
+        def apply_visibility_filter() -> None:
+            hidden = 0
+            for row_index, row in enumerate(rows):
+                should_hide = hide_no_change.isChecked() and "aucun changement" in str(row.get("status") or "").casefold()
+                table.setRowHidden(row_index, should_hide)
+                hidden += int(should_hide)
+            visible_count.setText(f"{len(rows) - hidden}/{len(rows)} ligne(s) affichée(s)")
+
+        hide_no_change.stateChanged.connect(apply_visibility_filter)
+        apply_visibility_filter()
+
+        detail = QTextEdit()
+        detail.setReadOnly(True)
+        detail.setMinimumHeight(170)
+        detail.setStyleSheet("font-family: monospace;")
+        layout.addWidget(detail)
+
+        def update_detail() -> None:
+            selected = table.selectedItems()
+            if not selected:
+                detail.setPlainText("Sélectionnez une ligne pour afficher le détail.")
+                return
+            public_row = {
+                key: value
+                for key, value in rows[selected[0].row()].items()
+                if not str(key).startswith("_") and key != "series"
+            }
+            detail.setPlainText(json_text(public_row))
+
+        def apply_manual_choice(row_index: int, selector: QComboBox) -> None:
+            choice = selector.currentData()
+            if not isinstance(choice, dict):
+                return
+            row = rows[row_index]
+            try:
+                candidate = self.nautiljon_client().get_series(str(choice.get("url") or ""))
+                current = row.get("_current_metadata") if isinstance(row.get("_current_metadata"), dict) else {}
+                if not current:
+                    current = self._fetch_current_series_preview_metadata(str(row.get("series_id") or ""))
+                    row["_current_metadata"] = current
+                proposed = {
+                    "tags": merge_nautiljon_tags(current.get("tags"), candidate.series_metadata.get("tags") or []),
+                    "links": merge_nautiljon_links(current.get("links"), candidate.source_url),
+                }
+                payload = self._payload_from_metadata_maps(current, proposed, ["tags", "links"], target_type="series")
+                eligible = bool(payload)
+                row.update(
+                    {
+                        "matched_title": str(choice.get("title") or candidate.series_title),
+                        "url": candidate.source_url,
+                        "score": float(choice.get("match_score") or 0),
+                        "tags": "; ".join(candidate.series_metadata.get("tags") or []),
+                        "eligible": eligible,
+                        "status": "Choix manuel — prêt" if eligible else "Choix manuel — aucun changement",
+                        "error": "",
+                        "manual_choice": True,
+                    }
+                )
+                check = table.item(row_index, 0) or QTableWidgetItem("")
+                check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                check.setCheckState(Qt.Checked if eligible else Qt.Unchecked)
+                if not eligible:
+                    check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+                table.setItem(row_index, 0, check)
+                for column, value in (
+                    (4, f"{row['score']:.3f}"),
+                    (6, row["status"]),
+                    (7, row["tags"]),
+                    (8, ""),
+                ):
+                    item = table.item(row_index, column) or QTableWidgetItem("")
+                    item.setText(str(value or ""))
+                    item.setToolTip(str(value or ""))
+                    table.setItem(row_index, column, item)
+                table.selectRow(row_index)
+                apply_visibility_filter()
+                update_detail()
+            except Exception as exc:
+                row.update({"eligible": False, "status": "Erreur choix manuel", "error": str(exc)})
+                check = table.item(row_index, 0)
+                if check is not None:
+                    check.setCheckState(Qt.Unchecked)
+                    check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+                for column, value in ((6, row["status"]), (8, row["error"])):
+                    item = table.item(row_index, column) or QTableWidgetItem("")
+                    item.setText(str(value))
+                    item.setToolTip(str(value))
+                    table.setItem(row_index, column, item)
+                apply_visibility_filter()
+                update_detail()
+
+        manual_statuses = {
+            "Score insuffisant",
+            "Résultats trop proches",
+            "Correspondance exacte ambiguë",
+        }
+        for row_index, row in enumerate(rows):
+            choices = row.get("choices") if isinstance(row.get("choices"), list) else []
+            if row.get("eligible") or row.get("status") not in manual_statuses or not choices:
+                continue
+            selector = QComboBox(table)
+            selector.addItem("Choisir parmi les 5 meilleurs…", None)
+            for choice in choices[:5]:
+                if not isinstance(choice, dict):
+                    continue
+                label = f"{float(choice.get('match_score') or 0):.3f} — {choice.get('title') or ''}"
+                selector.addItem(label, choice)
+                selector.setItemData(selector.count() - 1, str(choice.get("url") or ""), Qt.ToolTipRole)
+            selector.currentIndexChanged.connect(
+                lambda _index, current_row=row_index, current_selector=selector: apply_manual_choice(
+                    current_row,
+                    current_selector,
+                )
+            )
+            table.setCellWidget(row_index, 3, selector)
+
+        table.itemSelectionChanged.connect(update_detail)
+        if rows:
+            table.selectRow(0)
+
+        button_row = QHBoxLayout()
+        select_safe = QPushButton("Sélectionner les correspondances sûres")
+        apply_button = QPushButton("Valider et appliquer la sélection")
+        close_button = QPushButton("Fermer")
+
+        def select_all_safe() -> None:
+            for index, row in enumerate(rows):
+                item = table.item(index, 0)
+                if item and item.flags() & Qt.ItemIsEnabled:
+                    item.setCheckState(Qt.Checked if row.get("eligible") else Qt.Unchecked)
+
+        def apply_checked() -> None:
+            selected_rows = [
+                row
+                for index, row in enumerate(rows)
+                if (item := table.item(index, 0))
+                and item.flags() & Qt.ItemIsEnabled
+                and item.checkState() == Qt.Checked
+            ]
+            if not selected_rows:
+                QMessageBox.warning(dialog, "Automatch Nautiljon", "Aucune correspondance sûre sélectionnée.")
+                return
+            simulation = self.simulation_enabled()
+            if not simulation and QMessageBox.question(
+                dialog,
+                "Confirmer l’automatch Nautiljon",
+                f"Appliquer réellement {len(selected_rows)} série(s) ?\n\n"
+                "Les tags existants seront conservés et une sauvegarde restaurable sera créée avant chaque écriture.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+            dialog.accept()
+
+            def done(result: Dict[str, Any]) -> None:
+                mode = "simulation, aucune écriture" if result.get("simulation") else "écriture réelle"
+                modification_line = (
+                    f"{result.get('would_apply', 0)} modification(s) auraient été appliquée(s)."
+                    if result.get("simulation")
+                    else f"{result.get('applied', 0)} modification(s) appliquée(s)."
+                )
+                QMessageBox.information(
+                    self,
+                    "Automatch Nautiljon terminé",
+                    f"{result.get('processed', 0)} série(s) traitée(s).\n"
+                    f"{modification_line}\n"
+                    f"Mode : {mode}.",
+                )
+
+            self.run_worker(
+                "Application automatch Nautiljon",
+                lambda: self._apply_nautiljon_automatch_rows(selected_rows, simulation),
+                done,
+            )
+
+        select_safe.clicked.connect(select_all_safe)
+        apply_button.clicked.connect(apply_checked)
+        close_button.clicked.connect(dialog.reject)
+        button_row.addWidget(select_safe)
+        button_row.addStretch(1)
+        button_row.addWidget(apply_button)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        dialog.exec()
+
+    def select_safe_nautiljon_automatch_rows(self) -> None:
+        for index, row in enumerate(self.nautiljon_automatch_rows):
+            item = self.nautiljon_automatch_table.item(index, 0) or QTableWidgetItem("")
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+            item.setCheckState(Qt.Checked if row.get("eligible") else Qt.Unchecked)
+            self.nautiljon_automatch_table.setItem(index, 0, item)
+
+    def _apply_nautiljon_automatch_rows(
+        self,
+        selected_rows: List[Dict[str, Any]],
+        simulation: bool,
+    ) -> Dict[str, Any]:
+        api = self.komga_api()
+        client = self.nautiljon_client()
+        applied = 0
+        would_apply = 0
+        report: List[Dict[str, Any]] = []
+        for source_row in selected_rows:
+            row = dict(source_row)
+            try:
+                candidate = client.get_series(str(row.get("url") or ""))
+                current = self._fetch_current_series_preview_metadata(str(row.get("series_id") or ""))
+                proposed = {
+                    "tags": merge_nautiljon_tags(current.get("tags"), candidate.series_metadata.get("tags") or []),
+                    "links": merge_nautiljon_links(current.get("links"), candidate.source_url),
+                }
+                payload = self._payload_from_metadata_maps(current, proposed, ["tags", "links"], target_type="series")
+                row["payload_fields"] = "; ".join(payload.keys())
+                if not payload:
+                    row["operation_status"] = "Aucun changement après revalidation"
+                else:
+                    would_apply += 1
+                    if simulation:
+                        row["operation_status"] = "Simulation — aucune écriture"
+                    else:
+                        series_id = str(row.get("series_id") or "")
+                        self.backup.save_json(
+                            "operation",
+                            "series",
+                            series_id,
+                            {"current": current, "nautiljon": asdict(candidate), "payload": payload},
+                            "avant PATCH Nautiljon automatch",
+                        )
+                        self._write_metadata_update(
+                            api,
+                            "series",
+                            series_id,
+                            payload,
+                            current,
+                            source="nautiljon_automatch",
+                            note="Automatch tags Nautiljon",
+                        )
+                        applied += 1
+                        row["operation_status"] = "Appliqué"
+            except Exception as exc:
+                row["operation_status"] = "Erreur"
+                row["error"] = str(exc)
+            report.append(row)
+        return {
+            "rows": report,
+            "processed": len(selected_rows),
+            "would_apply": would_apply,
+            "applied": applied,
+            "simulation": simulation,
+        }
+
+    def apply_nautiljon_automatch(self) -> None:
+        selected = [
+            row
+            for index, row in enumerate(self.nautiljon_automatch_rows)
+            if row.get("eligible")
+            and self.nautiljon_automatch_table.item(index, 0)
+            and self.nautiljon_automatch_table.item(index, 0).checkState() == Qt.Checked
+        ]
+        if not selected:
+            QMessageBox.warning(self, "Nautiljon", "Aucune correspondance sûre cochée.")
+            return
+        if self.simulation_enabled():
+            self.log(f"Simulation active : {len(selected)} enrichissement(s) Nautiljon prévisualisé(s), aucune écriture")
+            return
+        if QMessageBox.question(self, "Confirmer Nautiljon", f"Appliquer les tags et liens Nautiljon à {len(selected)} série(s) ?\nLes tags existants seront conservés et une sauvegarde sera créée avant chaque écriture.", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        self.run_worker(
+            "Application automatch Nautiljon",
+            lambda: self._apply_nautiljon_automatch_rows(selected, False),
+            lambda result: self.log(f"✅ Nautiljon : {result.get('applied', 0)} série(s) enrichie(s)"),
         )
 
     def _build_mangabaka_tab(self) -> None:
@@ -7480,10 +8721,17 @@ class MainWindow(QMainWindow):
         self.mbk_komga_search = QLineEdit()
         self.mbk_komga_search.setPlaceholderText("Filtrer séries Komga...")
         btn_load_komga = QPushButton("Charger séries Komga")
+        self.mbk_automatch_button = QPushButton("Automatch multiple")
+        self.mbk_automatch_button.setObjectName("mbk_automatch_button")
+        self.mbk_automatch_cancel_button = QPushButton("Annuler automatch")
+        self.mbk_automatch_cancel_button.setObjectName("mbk_automatch_cancel_button")
+        self.mbk_automatch_cancel_button.setVisible(False)
         top.addWidget(QLabel("Bibliothèque"))
         top.addWidget(self.mbk_library_combo, 2)
         top.addWidget(self.mbk_komga_search, 2)
         top.addStretch(1)
+        top.addWidget(self.mbk_automatch_button)
+        top.addWidget(self.mbk_automatch_cancel_button)
         top.addWidget(btn_load_komga)
         layout.addLayout(top)
         layout.addLayout(self._make_source_series_filters_row("mbk", self.load_mangabaka_komga_series, fixed_link_labels=["MangaBaka"]))
@@ -7603,9 +8851,10 @@ class MainWindow(QMainWindow):
         batch_help.setReadOnly(True)
         batch_help.setPlainText(
             "Batch MangaBaka\n\n"
-            "Les actions batch restent déclenchées depuis l'onglet Explorateur.\n"
+            "Le bouton Automatch multiple active une sélection Ctrl/Shift sans modifier le parcours manuel.\n"
+            "Un tableau présente toutes les recherches ; seules les correspondances >= 90 % avec 5 points d'avance sont présélectionnées.\n"
             "Les comptes rendus détaillés sont affichés en popup, écrits dans les logs, et exportés en CSV dans le dossier de backup de session.\n\n"
-            "Garde-fous conservés : sélection obligatoire, type=manga par défaut, simulation respectée, backup avant PATCH réel."
+            "Garde-fous : (Chap) ignoré uniquement pour la recherche, validation séparée, simulation respectée et backup avant PATCH réel."
         )
         batch_layout.addWidget(batch_help, 1)
         workflow_tabs.addTab(batch_tab, "Traitement en masse / rapports")
@@ -7623,6 +8872,8 @@ class MainWindow(QMainWindow):
         self.mbk_target_id.setVisible(False)
 
         btn_load_komga.clicked.connect(self.load_mangabaka_komga_series)
+        self.mbk_automatch_button.clicked.connect(self.toggle_mangabaka_automatch_mode)
+        self.mbk_automatch_cancel_button.clicked.connect(self.leave_mangabaka_automatch_mode)
         self.mbk_library_combo.currentIndexChanged.connect(lambda *_: self.load_mangabaka_komga_series())
         self.mbk_komga_search.returnPressed.connect(self.load_mangabaka_komga_series)
         self.mbk_komga_series_table.itemSelectionChanged.connect(self.on_mangabaka_komga_series_selected)
@@ -7693,10 +8944,12 @@ class MainWindow(QMainWindow):
         self.mn_filter_manga_only = QCheckBox("media_kind=manga uniquement")
         self.mn_filter_manga_only.setChecked(True)
         btn_search = QPushButton("Rechercher")
+        btn_search_editions = QPushButton("Rechercher autres éditions")
         btn_fetch = QPushButton("Charger résultat")
         search_row.addWidget(self.mn_query, 2)
         search_row.addWidget(self.mn_filter_manga_only)
         search_row.addWidget(btn_search)
+        search_row.addWidget(btn_search_editions)
         search_row.addWidget(btn_fetch)
         right_layout.addLayout(search_row)
         mn_results_split = QSplitter(Qt.Vertical)
@@ -7816,6 +9069,7 @@ class MainWindow(QMainWindow):
         btn_from_komga.clicked.connect(self.use_selected_for_manga_news)
         btn_search.clicked.connect(self.search_manga_news)
         self.mn_query.returnPressed.connect(self.search_manga_news)
+        btn_search_editions.clicked.connect(self.search_manga_news_editions)
         btn_fetch.clicked.connect(self.fetch_selected_manga_news_series)
         self.mn_results_table.itemSelectionChanged.connect(self.on_manga_news_result_selected)
         self.mn_results_table.itemDoubleClicked.connect(lambda *_: self.fetch_selected_manga_news_series())
@@ -7830,6 +9084,231 @@ class MainWindow(QMainWindow):
         btn_mn_apply_book.clicked.connect(self.apply_manga_news_book)
         self.mn_komga_books_table.itemSelectionChanged.connect(self.on_manga_news_komga_book_selected)
         self._add_main_tab(tab, "Manga News")
+
+    def _build_mangacollec_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        info = QLabel(
+            "Importez un catalogue MangaCollec CSV ou JSON déjà généré. "
+            "Le matching est entièrement local et aucune connexion au site n'est effectuée. "
+            "Les correspondances exactes ou à score élevé unique sont utilisées automatiquement dans Prochaines sorties."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        controls = QGridLayout()
+        self.mangacollec_library_combo = self._make_library_combo("mangacollec")
+        self.mangacollec_file_label = QLabel("Aucun catalogue chargé")
+        self.mangacollec_status_label = QLabel("")
+        self.mangacollec_status_label.setWordWrap(True)
+        btn_import = QPushButton("Importer CSV / JSON")
+        btn_refresh = QPushButton("Actualiser le matching")
+        btn_next_releases = QPushButton("Ouvrir Prochaines sorties")
+        self.mangacollec_only_safe = QCheckBox("Afficher seulement les correspondances sûres")
+        self.mangacollec_only_safe.setChecked(True)
+        controls.addWidget(QLabel("Bibliothèque"), 0, 0)
+        controls.addWidget(self.mangacollec_library_combo, 0, 1, 1, 2)
+        controls.addWidget(btn_import, 0, 3)
+        controls.addWidget(btn_refresh, 0, 4)
+        controls.addWidget(btn_next_releases, 0, 5)
+        controls.addWidget(self.mangacollec_file_label, 1, 0, 1, 5)
+        controls.addWidget(self.mangacollec_status_label, 2, 0, 1, 5)
+        controls.addWidget(self.mangacollec_only_safe, 2, 5)
+        layout.addLayout(controls)
+
+        self.mangacollec_match_table = QTableWidget()
+        self._register_table(
+            self.mangacollec_match_table,
+            "mangacollec.matches",
+            default_hidden=["Komga ID"],
+        )
+        self.mangacollec_match_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.mangacollec_match_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.mangacollec_match_table, 1)
+
+        actions = QHBoxLayout()
+        btn_accept = QPushButton("Valider la proposition")
+        btn_assign = QPushButton("Affecter une série Komga…")
+        btn_remove = QPushButton("Retirer la correspondance manuelle")
+        actions.addWidget(btn_accept)
+        actions.addWidget(btn_assign)
+        actions.addWidget(btn_remove)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.mangacollec_detail = QTextEdit()
+        self.mangacollec_detail.setReadOnly(True)
+        self.mangacollec_detail.setMaximumHeight(180)
+        layout.addWidget(self.mangacollec_detail)
+
+        btn_import.clicked.connect(self.import_mangacollec_catalog)
+        btn_refresh.clicked.connect(self.refresh_mangacollec_matches)
+        btn_next_releases.clicked.connect(self.open_mangacollec_next_releases)
+        self.mangacollec_only_safe.stateChanged.connect(lambda *_: self._display_mangacollec_matches())
+        self.mangacollec_library_combo.currentIndexChanged.connect(
+            lambda *_: self.refresh_mangacollec_matches()
+        )
+        btn_accept.clicked.connect(self.accept_mangacollec_suggestion)
+        btn_assign.clicked.connect(self.assign_mangacollec_match)
+        btn_remove.clicked.connect(self.remove_mangacollec_match)
+        self.mangacollec_match_table.itemSelectionChanged.connect(
+            self.on_mangacollec_match_selected
+        )
+        self._refresh_mangacollec_catalog_status()
+        self._add_main_tab(tab, "MangaCollec")
+
+    def _refresh_mangacollec_catalog_status(self) -> None:
+        if not hasattr(self, "mangacollec_status_label"):
+            return
+        status = self.mangacollec_store.status()
+        if not status.get("configured"):
+            self.mangacollec_file_label.setText("Aucun catalogue MangaCollec chargé")
+            self.mangacollec_status_label.setText("")
+            return
+        self.mangacollec_file_label.setText(f"Catalogue actif : {status.get('filename') or 'fichier importé'}")
+        self.mangacollec_status_label.setText(
+            f"{status.get('release_count', 0)} sortie(s) · {status.get('series_count', 0)} série(s) · "
+            f"période {status.get('date_min', '—')} → {status.get('date_max', '—')} · "
+            f"{status.get('duplicates', 0)} doublon(s) écarté(s) · "
+            f"{status.get('mapping_count', 0)} correspondance(s) mémorisée(s)."
+        )
+
+    def import_mangacollec_catalog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Catalogue MangaCollec",
+            "",
+            "Catalogues MangaCollec (*.csv *.json);;Tous fichiers (*)",
+        )
+        if not path:
+            return
+        try:
+            self.mangacollec_store.import_file(path)
+            self._refresh_mangacollec_catalog_status()
+            self._refresh_next_release_mangacollec_status()
+            self.refresh_mangacollec_matches()
+        except Exception as exc:
+            QMessageBox.critical(self, "MangaCollec", str(exc))
+
+    def refresh_mangacollec_matches(self) -> None:
+        if not hasattr(self, "mangacollec_match_table"):
+            return
+        if not self.mangacollec_store.status().get("configured"):
+            self.mangacollec_match_rows = []
+            self._set_table(self.mangacollec_match_table, ["Série MangaCollec"], [])
+            return
+        library_id = self._library_id("mangacollec")
+
+        def done(rows: List[Any]) -> None:
+            self.mangacollec_komga_rows = list(rows or [])
+            self.mangacollec_match_all_rows = self.mangacollec_store.match_rows(rows)
+            self._display_mangacollec_matches()
+            self._refresh_mangacollec_catalog_status()
+
+        self.run_worker(
+            "Matching MangaCollec",
+            lambda: self._cached_series(library_id, page_size=500),
+            done,
+        )
+
+    def _display_mangacollec_matches(self) -> None:
+        if not hasattr(self, "mangacollec_match_table"):
+            return
+        self.mangacollec_match_rows = [
+            row for row in self.mangacollec_match_all_rows
+            if not self.mangacollec_only_safe.isChecked() or row.get("usable")
+        ]
+        if self.mangacollec_match_all_rows:
+            self._set_table(
+                self.mangacollec_match_table,
+                ["Série MangaCollec", "Tome", "Date", "Série Komga", "Score", "Statut", "Komga ID"],
+                [
+                    [
+                        row.get("source_title", ""),
+                        row.get("next_volume", ""),
+                        row.get("next_date", ""),
+                        row.get("komga_title", ""),
+                        f"{float(row.get('score') or 0) * 100:.1f} %",
+                        row.get("status", ""),
+                        row.get("komga_series_id", ""),
+                    ]
+                    for row in self.mangacollec_match_rows
+                ],
+                stretch_from=0,
+                selection_mode=QAbstractItemView.SingleSelection,
+                row_data=self.mangacollec_match_rows,
+            )
+
+    def open_mangacollec_next_releases(self) -> None:
+        index = self.nr_source_combo.findData("mangacollec")
+        if index >= 0:
+            self.nr_source_combo.setCurrentIndex(index)
+        self._set_current_tab_by_title("Prochaines sorties")
+        self.load_next_release_series()
+
+    def _selected_mangacollec_match(self) -> Optional[Dict[str, Any]]:
+        index = self._selected_row_index(self.mangacollec_match_table)
+        if 0 <= index < len(self.mangacollec_match_rows):
+            return self.mangacollec_match_rows[index]
+        return None
+
+    def on_mangacollec_match_selected(self) -> None:
+        row = self._selected_mangacollec_match()
+        if row is not None:
+            self.mangacollec_detail.setPlainText(json_text(row))
+
+    def _save_mangacollec_match(self, row: Dict[str, Any], series_id: str) -> None:
+        target = next(
+            (item for item in self.mangacollec_komga_rows if str(getattr(item, "id", "")) == series_id),
+            None,
+        )
+        if target is None:
+            raise ValueError("Série Komga introuvable")
+        self.mangacollec_store.save_mapping(
+            str(row.get("source_title") or ""),
+            series_id,
+            str(getattr(target, "title", "") or ""),
+        )
+        self.refresh_mangacollec_matches()
+
+    def accept_mangacollec_suggestion(self) -> None:
+        row = self._selected_mangacollec_match()
+        if row is None or not row.get("komga_series_id"):
+            QMessageBox.warning(self, "MangaCollec", "Aucune proposition sélectionnée")
+            return
+        self._save_mangacollec_match(row, str(row["komga_series_id"]))
+
+    def assign_mangacollec_match(self) -> None:
+        row = self._selected_mangacollec_match()
+        if row is None:
+            QMessageBox.warning(self, "MangaCollec", "Aucune ligne sélectionnée")
+            return
+        choices = sorted(
+            [
+                (str(getattr(item, "title", "") or getattr(item, "id", "")), str(getattr(item, "id", "")))
+                for item in self.mangacollec_komga_rows
+                if str(getattr(item, "id", ""))
+            ],
+            key=lambda item: item[0].casefold(),
+        )
+        labels = [f"{title}  [{series_id}]" for title, series_id in choices]
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Affecter MangaCollec",
+            str(row.get("source_title") or ""),
+            labels,
+            0,
+            False,
+        )
+        if ok and selected:
+            self._save_mangacollec_match(row, choices[labels.index(selected)][1])
+
+    def remove_mangacollec_match(self) -> None:
+        row = self._selected_mangacollec_match()
+        if row is None:
+            return
+        self.mangacollec_store.delete_mapping(str(row.get("source_title") or ""))
+        self.refresh_mangacollec_matches()
 
     def _build_next_releases_tab(self) -> None:
         tab = QWidget()
@@ -7846,18 +9325,29 @@ class MainWindow(QMainWindow):
         tab_layout.addWidget(scroll, 1)
 
         info = QLabel(
-            "Recherche des prochaines sorties via Manga News ou MangaBaka. "
+            "Recherche des prochaines sorties via Manga News, MangaBaka ou le catalogue local MangaCollec. "
             "MangaBaka est strict : aucun tag n'est proposé si la fiche ne fournit pas une prochaine sortie datée. "
             f"Le tag Komga écrit est unique et technique : {NEXT_RELEASE_TAG_PREFIX}<tome>-<jj.mm.aaaa>."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
+        self.nr_mangacollec_box = QGroupBox("Catalogue MangaCollec local")
+        nr_mc_layout = QHBoxLayout(self.nr_mangacollec_box)
+        self.nr_mangacollec_catalog_status = QLabel("Aucun catalogue MangaCollec chargé")
+        self.nr_mangacollec_catalog_status.setWordWrap(True)
+        btn_nr_mc_import = QPushButton("Importer CSV / JSON")
+        nr_mc_layout.addWidget(self.nr_mangacollec_catalog_status, 1)
+        nr_mc_layout.addWidget(btn_nr_mc_import)
+        self.nr_mangacollec_box.setVisible(False)
+        layout.addWidget(self.nr_mangacollec_box)
+
         controls = QGridLayout()
         self.nr_library_combo = self._make_library_combo("next_releases")
         self.nr_source_combo = QComboBox()
         self.nr_source_combo.addItem("Manga News", "manga_news")
         self.nr_source_combo.addItem("MangaBaka", "mangabaka")
+        self.nr_source_combo.addItem("MangaCollec (fichier local)", "mangacollec")
         self.nr_search = QLineEdit()
         self.nr_search.setPlaceholderText("Filtrer séries Komga...")
         self.nr_only_not_ended = QCheckBox("Statut non terminé uniquement")
@@ -7927,8 +9417,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
 
         btn_load.clicked.connect(self.load_next_release_series)
+        btn_nr_mc_import.clicked.connect(self.import_mangacollec_catalog)
         self.nr_library_combo.currentIndexChanged.connect(lambda *_: self.load_next_release_series())
-        self.nr_source_combo.currentIndexChanged.connect(lambda *_: self._apply_next_release_series_filters())
+        self.nr_source_combo.currentIndexChanged.connect(lambda *_: self._next_release_source_changed())
         self.nr_search.returnPressed.connect(self.load_next_release_series)
         self.nr_only_not_ended.stateChanged.connect(lambda *_: self._apply_next_release_series_filters())
         self.nr_require_source_link.stateChanged.connect(lambda *_: self._apply_next_release_series_filters())
@@ -7940,6 +9431,7 @@ class MainWindow(QMainWindow):
         self.nr_series_table.itemSelectionChanged.connect(self._update_next_release_scope_labels)
         self.nr_results_table.itemSelectionChanged.connect(self.on_next_release_result_selected)
         self.nr_results_table.itemSelectionChanged.connect(self._update_next_release_scope_labels)
+        self._refresh_next_release_mangacollec_status()
         self._add_main_tab(tab, "Prochaines sorties")
 
     def _build_comicvine_tab(self) -> None:
@@ -8179,6 +9671,135 @@ class MainWindow(QMainWindow):
         self.cv_issues_table.itemDoubleClicked.connect(lambda *_: self.fetch_selected_comicvine_issue())
         self.cv_book_match_table.itemSelectionChanged.connect(self.on_comicvine_book_match_selected)
         self._add_main_tab(tab, "ComicVine")
+
+
+    def _build_metron_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self._add_source_workflow_header(
+            layout,
+            "Metron",
+            "Recherche mono-série via l’API Metron. Le titre Komga n’est pas remplacé automatiquement ; "
+            "le résumé, le statut, l’éditeur, le nombre d’issues, les genres, les titres alternatifs et le lien sont proposés à la comparaison.",
+        )
+
+        top = QHBoxLayout()
+        self.metron_library_combo = self._make_library_combo("metron")
+        self.metron_komga_search = QLineEdit()
+        self.metron_komga_search.setPlaceholderText("Filtrer séries Komga...")
+        btn_load_komga = QPushButton("Charger séries Komga")
+        btn_from_komga = QPushButton("Utiliser sélection explorateur")
+        top.addWidget(QLabel("Bibliothèque"))
+        top.addWidget(self.metron_library_combo, 2)
+        top.addWidget(self.metron_komga_search, 2)
+        top.addWidget(btn_load_komga)
+        top.addWidget(btn_from_komga)
+        layout.addLayout(top)
+        layout.addLayout(self._make_source_series_filters_row("metron", self.load_metron_komga_series, fixed_link_labels=["Metron"]))
+
+        main_split = QSplitter(Qt.Horizontal)
+        main_split.setChildrenCollapsible(False)
+        main_split.setMinimumHeight(390)
+
+        left_box = QGroupBox("Komga — séries")
+        left_layout = QVBoxLayout(left_box)
+        self.metron_komga_series_table = QTableWidget()
+        self._register_table(self.metron_komga_series_table, "metron.komga_series", default_hidden=["ID"])
+        self._register_series_table_rows(self.metron_komga_series_table, "metron_komga_series_rows")
+        self.metron_komga_series_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.metron_komga_series_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.metron_komga_series_table.setMinimumHeight(300)
+        left_layout.addWidget(self.metron_komga_series_table, 1)
+        main_split.addWidget(left_box)
+
+        right_box = QGroupBox("Metron — recherche API")
+        right_layout = QVBoxLayout(right_box)
+        search_row = QHBoxLayout()
+        self.metron_query = QLineEdit()
+        self.metron_query.setPlaceholderText("Recherche Metron, ex. Amazing Spider-Man")
+        btn_search = QPushButton("Rechercher")
+        btn_fetch = QPushButton("Charger résultat sélectionné")
+        search_row.addWidget(self.metron_query, 2)
+        search_row.addWidget(btn_search)
+        search_row.addWidget(btn_fetch)
+        right_layout.addLayout(search_row)
+        result_split = QSplitter(Qt.Horizontal)
+        result_split.setChildrenCollapsible(False)
+        self.metron_results_table = QTableWidget()
+        self._register_table(self.metron_results_table, "metron.results", default_hidden=["ID", "URL"])
+        self.metron_results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.metron_results_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.metron_results_table.setMinimumHeight(280)
+        result_split.addWidget(self.metron_results_table)
+        detail = self._make_selection_detail_panel("metron.result", "Détails résultat Metron")
+        detail.setMinimumWidth(390)
+        detail.setMinimumHeight(280)
+        result_split.addWidget(detail)
+        result_split.setSizes([760, 460])
+        right_layout.addWidget(result_split, 1)
+        main_split.addWidget(right_box)
+        main_split.setSizes([620, 940])
+        layout.addWidget(main_split, 1)
+
+        workflow_tabs = QTabWidget()
+        workflow_tabs.setMinimumHeight(620)
+        series_tab = QWidget()
+        series_layout = QVBoxLayout(series_tab)
+        actions = QHBoxLayout()
+        btn_preview = QPushButton("Prévisualiser")
+        btn_apply = QPushButton("Appliquer série")
+        btn_fit_columns = QPushButton("Ajuster colonnes")
+        btn_compact_rows = QPushButton("Lignes compactes")
+        btn_fit_rows = QPushButton("Lignes auto")
+        actions.addWidget(btn_preview)
+        actions.addWidget(btn_apply)
+        actions.addWidget(btn_fit_columns)
+        actions.addWidget(btn_compact_rows)
+        actions.addWidget(btn_fit_rows)
+        actions.addStretch(1)
+        series_layout.addLayout(actions)
+        diff_split = QSplitter(Qt.Vertical)
+        self.metron_series_metadata_table = QTableWidget()
+        self._register_table(self.metron_series_metadata_table, "metron.series_diff")
+        self._fill_series_preview_metadata_table(self.metron_series_metadata_table, {}, {})
+        self.metron_series_metadata_table.setMinimumHeight(300)
+        diff_split.addWidget(self.metron_series_metadata_table)
+        self.metron_series_preview = QTextEdit()
+        self.metron_series_preview.setReadOnly(True)
+        self.metron_series_preview.setMinimumHeight(180)
+        diff_split.addWidget(self.metron_series_preview)
+        diff_split.setSizes([420, 260])
+        series_layout.addWidget(diff_split, 1)
+        workflow_tabs.addTab(series_tab, "Série")
+
+        technical_tab = QWidget()
+        technical_layout = QVBoxLayout(technical_tab)
+        self.metron_raw = QTextEdit()
+        self.metron_raw.setReadOnly(True)
+        self.metron_raw.setStyleSheet("font-family: monospace;")
+        technical_layout.addWidget(self.metron_raw, 1)
+        workflow_tabs.addTab(technical_tab, "Données techniques")
+        layout.addWidget(workflow_tabs, 1)
+
+        self.metron_target_id = QLineEdit()
+        self.metron_target_id.setVisible(False)
+
+        btn_load_komga.clicked.connect(self.load_metron_komga_series)
+        self.metron_library_combo.currentIndexChanged.connect(lambda *_: self.load_metron_komga_series())
+        self.metron_komga_search.returnPressed.connect(self.load_metron_komga_series)
+        self.metron_komga_series_table.itemSelectionChanged.connect(self.on_metron_komga_series_selected)
+        btn_from_komga.clicked.connect(self.use_selected_for_metron)
+        btn_search.clicked.connect(self.search_metron)
+        self.metron_query.returnPressed.connect(self.search_metron)
+        btn_fetch.clicked.connect(self.fetch_selected_metron_series)
+        self.metron_results_table.itemSelectionChanged.connect(self.on_metron_result_selected)
+        self.metron_results_table.itemDoubleClicked.connect(lambda *_: self.fetch_selected_metron_series())
+        btn_preview.clicked.connect(self.preview_metron_series)
+        btn_apply.clicked.connect(self.apply_metron_series)
+        btn_fit_columns.clicked.connect(lambda: self._fit_metadata_table_columns(self.metron_series_metadata_table))
+        btn_compact_rows.clicked.connect(lambda: self._compact_metadata_table(self.metron_series_metadata_table))
+        btn_fit_rows.clicked.connect(lambda: self._fit_metadata_table_rows(self.metron_series_metadata_table))
+        self._add_main_tab(tab, "Metron")
 
 
 
@@ -8480,6 +10101,1553 @@ class MainWindow(QMainWindow):
             self._set_current_tab_by_title(target)
 
     # ------------------------------------------------------------------
+    # Nettoyage
+    # ------------------------------------------------------------------
+    def _build_cleanup_tab(self) -> None:
+        tab = QWidget()
+        root_layout = QVBoxLayout(tab)
+        cleanup_tabs = QTabWidget()
+        alternate_tab = QWidget()
+        layout = QVBoxLayout(alternate_tab)
+        intro = QLabel(
+            "Nettoyage extensible de la bibliothèque. Règle active : conserver les titres alternatifs "
+            "français, anglais et japonais uniquement. Les labels existants sont préservés ; Romaji est "
+            "japonais et Native est déterminé par l’écriture. Les anciens « alt » ambigus restent à vérifier."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        controls = QHBoxLayout()
+        self.cleanup_library_combo = self._make_library_combo("cleanup")
+        self.cleanup_added_filter = QComboBox()
+        for label, days in (("Toutes les dates", 0), ("Aujourd’hui", 1), ("7 derniers jours", 7), ("30 derniers jours", 30), ("90 derniers jours", 90), ("1 an", 365)):
+            self.cleanup_added_filter.addItem(label, days)
+        self.cleanup_only_changes = QCheckBox("Afficher uniquement les séries à modifier")
+        self.cleanup_only_changes.setChecked(True)
+        btn_analyze = QPushButton("Analyser")
+        btn_select = QPushButton("Sélectionner les corrections sûres")
+        self.cleanup_preview_button = QPushButton("Prévisualiser la sélection")
+        self.cleanup_apply_button = QPushButton("Valider et appliquer")
+        controls.addWidget(QLabel("Bibliothèque"))
+        controls.addWidget(self.cleanup_library_combo)
+        controls.addWidget(QLabel("Ajout Komga"))
+        controls.addWidget(self.cleanup_added_filter)
+        controls.addWidget(self.cleanup_only_changes)
+        controls.addWidget(btn_analyze)
+        controls.addWidget(btn_select)
+        controls.addWidget(self.cleanup_preview_button)
+        controls.addWidget(self.cleanup_apply_button)
+        layout.addLayout(controls)
+
+        self.cleanup_summary_label = QLabel("Aucune analyse lancée.")
+        self.cleanup_summary_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.cleanup_summary_label)
+        self.cleanup_review_policy_label = QLabel(
+            "REVIEW = conservé strictement inchangé lors de l’application. Pour le résoudre, sélectionnez une ou plusieurs "
+            "séries (Ctrl/Shift pour une sélection multiple) puis faites un clic droit : classer les REVIEW en FR/EN/JA ou les retirer. "
+            "Décochez « uniquement les séries à modifier » pour afficher les séries qui n’ont que des REVIEW."
+        )
+        self.cleanup_review_policy_label.setWordWrap(True)
+        self.cleanup_review_policy_label.setStyleSheet("padding: 8px; border: 1px solid #9a6b2f; background: #49361f; color: #ffd394;")
+        layout.addWidget(self.cleanup_review_policy_label)
+
+        split = QSplitter(Qt.Vertical)
+        self.cleanup_table = QTableWidget()
+        self._register_table(self.cleanup_table, "cleanup.alternate_titles")
+        self.cleanup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.cleanup_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        split.addWidget(self.cleanup_table)
+        self.cleanup_detail_table = QTableWidget()
+        self._register_table(self.cleanup_detail_table, "cleanup.alternate_title_details")
+        self.cleanup_detail_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.cleanup_detail_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        split.addWidget(self.cleanup_detail_table)
+        split.setSizes([520, 250])
+        layout.addWidget(split, 1)
+
+        btn_analyze.clicked.connect(self.run_alternate_title_cleanup_scan)
+        btn_select.clicked.connect(self.select_safe_cleanup_rows)
+        self.cleanup_preview_button.clicked.connect(self.preview_alternate_title_cleanup)
+        self.cleanup_apply_button.clicked.connect(self.apply_alternate_title_cleanup)
+        self.cleanup_table.itemSelectionChanged.connect(self.show_alternate_title_cleanup_detail)
+        self.cleanup_table.customContextMenuRequested.connect(self.show_cleanup_series_context_menu)
+        self.cleanup_only_changes.toggled.connect(self.refresh_alternate_title_cleanup_table)
+        self.cleanup_detail_table.customContextMenuRequested.connect(self.show_cleanup_title_context_menu)
+        cleanup_tabs.addTab(alternate_tab, "Titres alternatifs")
+        cleanup_tabs.addTab(self._build_author_cleanup_subtab(), "Auteurs / contributeurs")
+        cleanup_tabs.addTab(self._build_language_cleanup_subtab(), "Langues")
+        cleanup_tabs.addTab(self._build_chapter_cleanup_subtab(), "Séries Chap")
+        self.cleanup_tabs = cleanup_tabs
+        root_layout.addWidget(cleanup_tabs)
+        self._add_main_tab(tab, "Nettoyage")
+
+    def _build_author_cleanup_subtab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        intro = QLabel(
+            "Regroupe les variantes probables d'un même auteur et propose une écriture canonique « Prénom Nom ». "
+            "Les rôles sont conservés, les doublons ne sont fusionnés qu'à rôle identique et les métadonnées "
+            "verrouillées ne sont jamais modifiées. Les décisions validées seront réutilisées lors des futurs enrichissements."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        controls = QHBoxLayout()
+        self.author_cleanup_library_combo = self._make_library_combo("cleanup_authors")
+        self.author_cleanup_search = QLineEdit()
+        self.author_cleanup_search.setPlaceholderText("Filtrer un auteur ou une variante…")
+        self.author_cleanup_confidence = QComboBox()
+        for label, value in (
+            ("Tous les niveaux", ""),
+            ("Confirmé", "confirmed"),
+            ("Sûr", "safe"),
+            ("Probable", "likely"),
+            ("À vérifier", "review"),
+        ):
+            self.author_cleanup_confidence.addItem(label, value)
+        self.author_cleanup_only_changes = QCheckBox("Afficher uniquement les groupes à modifier")
+        self.author_cleanup_only_changes.setChecked(True)
+        btn_analyze = QPushButton("Analyser")
+        btn_select = QPushButton("Sélectionner les corrections sûres")
+        btn_preview = QPushButton("Prévisualiser la sélection")
+        btn_apply = QPushButton("Valider et appliquer")
+        controls.addWidget(QLabel("Bibliothèque"))
+        controls.addWidget(self.author_cleanup_library_combo)
+        controls.addWidget(self.author_cleanup_search, 1)
+        controls.addWidget(self.author_cleanup_confidence)
+        controls.addWidget(self.author_cleanup_only_changes)
+        controls.addWidget(btn_analyze)
+        controls.addWidget(btn_select)
+        controls.addWidget(btn_preview)
+        controls.addWidget(btn_apply)
+        layout.addLayout(controls)
+
+        self.author_cleanup_summary_label = QLabel("Aucune analyse lancée.")
+        self.author_cleanup_summary_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.author_cleanup_summary_label)
+        policy = QLabel(
+            "SÛR/CONFIRMÉ = coché automatiquement. PROBABLE et À VÉRIFIER restent décochés. "
+            "Le nom canonique est modifiable directement dans le tableau avant la prévisualisation."
+        )
+        policy.setWordWrap(True)
+        policy.setStyleSheet("padding: 8px; border: 1px solid #496b8f; background: #25384c;")
+        layout.addWidget(policy)
+
+        split = QSplitter(Qt.Vertical)
+        self.author_cleanup_table = QTableWidget()
+        self._register_table(self.author_cleanup_table, "cleanup.authors")
+        self.author_cleanup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        split.addWidget(self.author_cleanup_table)
+        detail_panel = QWidget()
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.author_cleanup_composite_label = QLabel(
+            "Valeur composite : sélectionnez une ligne contenant « / » pour choisir son traitement."
+        )
+        self.author_cleanup_composite_label.setWordWrap(True)
+        detail_layout.addWidget(self.author_cleanup_composite_label)
+        composite_actions = QHBoxLayout()
+        btn_composite_left = QPushButton("Utiliser la partie gauche")
+        btn_composite_right = QPushButton("Utiliser la partie droite")
+        btn_composite_keep = QPushButton("Conserver la valeur complète")
+        btn_composite_split = QPushButton("Scinder en plusieurs contributeurs")
+        composite_actions.addWidget(btn_composite_left)
+        composite_actions.addWidget(btn_composite_right)
+        composite_actions.addWidget(btn_composite_keep)
+        composite_actions.addWidget(btn_composite_split)
+        composite_actions.addStretch(1)
+        detail_layout.addLayout(composite_actions)
+        self.author_cleanup_detail_table = QTableWidget()
+        self._register_table(self.author_cleanup_detail_table, "cleanup.author_details")
+        detail_layout.addWidget(self.author_cleanup_detail_table, 1)
+        split.addWidget(detail_panel)
+        split.setSizes([540, 240])
+        layout.addWidget(split, 1)
+
+        btn_analyze.clicked.connect(self.run_author_cleanup_scan)
+        btn_select.clicked.connect(self.select_safe_author_cleanup_rows)
+        btn_preview.clicked.connect(self.preview_author_cleanup)
+        btn_apply.clicked.connect(self.apply_author_cleanup)
+        self.author_cleanup_search.textChanged.connect(self.refresh_author_cleanup_table)
+        self.author_cleanup_confidence.currentIndexChanged.connect(self.refresh_author_cleanup_table)
+        self.author_cleanup_only_changes.toggled.connect(self.refresh_author_cleanup_table)
+        self.author_cleanup_table.itemSelectionChanged.connect(self.show_author_cleanup_detail)
+        self.author_cleanup_table.itemChanged.connect(self._remember_author_cleanup_item)
+        btn_composite_left.clicked.connect(lambda: self.set_author_composite_choice("left"))
+        btn_composite_right.clicked.connect(lambda: self.set_author_composite_choice("right"))
+        btn_composite_keep.clicked.connect(lambda: self.set_author_composite_choice("keep"))
+        btn_composite_split.clicked.connect(lambda: self.set_author_composite_choice("split"))
+        return tab
+
+    @staticmethod
+    def _author_cleanup_has_change(group: Dict[str, Any], replacement: Any) -> bool:
+        targets = [str(value or "").strip() for value in (replacement if isinstance(replacement, list) else [replacement])]
+        targets = [value for value in targets if value]
+        variants = group.get("variants") if isinstance(group.get("variants"), list) else []
+        if len(targets) != 1:
+            return bool(targets)
+        return any(str(item.get("name") or "").strip() != targets[0] for item in variants if isinstance(item, dict))
+
+    def run_author_cleanup_scan(self) -> None:
+        library_id = self._library_id("cleanup_authors")
+
+        def scan() -> List[Dict[str, Any]]:
+            series_rows = self._cached_series(library_id=library_id or None, page_size=500, max_age_seconds=60.0)
+            references = load_cached_author_references(
+                {
+                    "mangabaka": self.mangabaka_cache_dir.text().strip() or ".komga_db_tool_cache/mangabaka",
+                    "manga_news": self.manga_news_cache_dir.text().strip() or ".komga_db_tool_cache/manga_news",
+                },
+                index_path=Path(".komga_db_tool_cache") / "author_cleanup" / "reference_index.json",
+            )
+            return scan_author_groups(
+                series_rows,
+                self.author_canonical_store.mappings(),
+                references,
+            )
+
+        def done(rows: List[Dict[str, Any]]) -> None:
+            self.author_cleanup_rows = list(rows)
+            self.author_cleanup_book_changes = []
+            self.author_cleanup_preview_mappings = {}
+            self.author_cleanup_preview_pending_decisions = []
+            self.author_cleanup_preview_ready = False
+            self.author_cleanup_canonicals = {
+                str(row.get("group_id") or ""): str(row.get("canonical") or "") for row in rows
+            }
+            self.author_cleanup_replacements = {
+                str(row.get("group_id") or ""): [
+                    str(value or "").strip() for value in row.get("replacement_names") or [row.get("canonical")]
+                    if str(value or "").strip()
+                ]
+                for row in rows
+            }
+            self.author_cleanup_checked = {
+                str(row.get("group_id") or "") for row in rows if bool(row.get("safe"))
+            }
+            self.refresh_author_cleanup_table()
+            counts: Dict[str, int] = {}
+            for row in rows:
+                confidence = str(row.get("confidence") or "review")
+                counts[confidence] = counts.get(confidence, 0) + 1
+            self.author_cleanup_summary_label.setText(
+                f"{len(rows)} groupe(s) · {counts.get('confirmed', 0)} confirmé(s) · "
+                f"{counts.get('safe', 0)} sûr(s) · {counts.get('likely', 0)} probable(s) · "
+                f"{counts.get('review', 0)} à vérifier."
+            )
+            self._set_table(
+                self.author_cleanup_detail_table,
+                ["Variante", "Occurrences", "Séries", "Rôles", "Bibliothèques"],
+                [],
+            )
+
+        self.run_worker("Analyse des noms d'auteurs", scan, done)
+
+    def _remember_author_cleanup_item(self, item: QTableWidgetItem) -> None:
+        if self._author_cleanup_refreshing or item is None:
+            return
+        anchor = self.author_cleanup_table.item(item.row(), 0)
+        group = anchor.data(Qt.UserRole) if anchor is not None else None
+        if not isinstance(group, dict):
+            return
+        group_id = str(group.get("group_id") or "")
+        if item.column() == 0:
+            if item.checkState() == Qt.Checked:
+                self.author_cleanup_checked.add(group_id)
+            else:
+                self.author_cleanup_checked.discard(group_id)
+            self.author_cleanup_book_changes = []
+            self.author_cleanup_preview_mappings = {}
+            self.author_cleanup_preview_pending_decisions = []
+            self.author_cleanup_preview_ready = False
+        elif item.column() == 3:
+            self.author_cleanup_canonicals[group_id] = item.text().strip()
+            self.author_cleanup_replacements[group_id] = [item.text().strip()] if item.text().strip() else []
+            self.author_cleanup_book_changes = []
+            self.author_cleanup_preview_mappings = {}
+            self.author_cleanup_preview_pending_decisions = []
+            self.author_cleanup_preview_ready = False
+
+    def refresh_author_cleanup_table(self) -> None:
+        if not hasattr(self, "author_cleanup_table"):
+            return
+        query = self.author_cleanup_search.text().strip().casefold()
+        confidence_filter = str(self.author_cleanup_confidence.currentData() or "")
+        rows: List[Dict[str, Any]] = []
+        for row in self.author_cleanup_rows:
+            group_id = str(row.get("group_id") or "")
+            canonical = self.author_cleanup_canonicals.get(group_id, str(row.get("canonical") or ""))
+            replacement = self.author_cleanup_replacements.get(group_id, [canonical])
+            variants = row.get("variants") if isinstance(row.get("variants"), list) else []
+            searchable = " ".join([canonical, *(str(item.get("name") or "") for item in variants if isinstance(item, dict))]).casefold()
+            if query and query not in searchable:
+                continue
+            if confidence_filter and str(row.get("confidence") or "") != confidence_filter:
+                continue
+            if self.author_cleanup_only_changes.isChecked() and not self._author_cleanup_has_change(row, replacement):
+                continue
+            rows.append(row)
+
+        labels = {
+            "confirmed": "Confirmé",
+            "safe": "Sûr",
+            "likely": "Probable",
+            "review": "À vérifier",
+        }
+        table_rows: List[List[Any]] = []
+        for row in rows:
+            group_id = str(row.get("group_id") or "")
+            variants = row.get("variants") if isinstance(row.get("variants"), list) else []
+            replacement = self.author_cleanup_replacements.get(group_id, [str(row.get("canonical") or "")])
+            table_rows.append([
+                "",
+                labels.get(str(row.get("confidence") or ""), str(row.get("confidence") or "")),
+                "Scinder" if len(replacement) > 1 else (
+                    "Normaliser" if self._author_cleanup_has_change(row, replacement) else "Conserver"
+                ),
+                self.author_cleanup_canonicals.get(group_id, str(row.get("canonical") or "")),
+                " | ".join(str(item.get("name") or "") for item in variants if isinstance(item, dict)),
+                row.get("occurrences", 0),
+                row.get("series_count", 0),
+                ", ".join(str(value) for value in row.get("roles") or []),
+                len(row.get("libraries") or []),
+                ", ".join(str(value) for value in row.get("reference_sources") or []),
+                row.get("reason", ""),
+            ])
+        self._author_cleanup_refreshing = True
+        try:
+            self._set_table(
+                self.author_cleanup_table,
+                ["Appliquer", "Confiance", "Action", "Nom canonique", "Variantes", "Occurrences", "Séries", "Rôles", "Bibliothèques", "Référence", "Raison"],
+                table_rows,
+                stretch_from=4,
+                selection_mode=QAbstractItemView.ExtendedSelection,
+                row_data=rows,
+            )
+            for index, row in enumerate(rows):
+                group_id = str(row.get("group_id") or "")
+                check_item = self.author_cleanup_table.item(index, 0)
+                if check_item is not None:
+                    check_item.setFlags(check_item.flags() | Qt.ItemIsUserCheckable)
+                    check_item.setCheckState(Qt.Checked if group_id in self.author_cleanup_checked else Qt.Unchecked)
+                canonical_item = self.author_cleanup_table.item(index, 3)
+                if canonical_item is not None:
+                    canonical_item.setFlags(canonical_item.flags() | Qt.ItemIsEditable)
+        finally:
+            self._author_cleanup_refreshing = False
+
+    def show_author_cleanup_detail(self) -> None:
+        row = self._selected_row_data(self.author_cleanup_table)
+        if not isinstance(row, dict):
+            self.author_cleanup_composite_label.setText(
+                "Valeur composite : sélectionnez une ligne contenant « / » pour choisir son traitement."
+            )
+            self._set_table(self.author_cleanup_detail_table, ["Variante", "Occurrences", "Séries", "Rôles", "Bibliothèques"], [])
+            return
+        parts = [str(value or "").strip() for value in row.get("composite_parts") or [] if str(value or "").strip()]
+        if parts:
+            self.author_cleanup_composite_label.setText(
+                "Valeur composite détectée : " + " / ".join(parts) +
+                ". Aucun choix n'est automatique : utilisez les boutons puis contrôlez l'aperçu."
+            )
+        else:
+            self.author_cleanup_composite_label.setText("Ce groupe n'est pas une valeur composite.")
+        details: List[List[Any]] = []
+        for variant in row.get("variants") or []:
+            if not isinstance(variant, dict):
+                continue
+            roles = variant.get("roles") if isinstance(variant.get("roles"), dict) else {}
+            libraries = variant.get("libraries") if isinstance(variant.get("libraries"), dict) else {}
+            details.append([
+                variant.get("name", ""),
+                variant.get("occurrences", 0),
+                variant.get("series_count", 0),
+                ", ".join(f"{name} ({count})" for name, count in roles.items()),
+                ", ".join(f"{name} ({count})" for name, count in libraries.items()),
+            ])
+        self._set_table(
+            self.author_cleanup_detail_table,
+            ["Variante", "Occurrences", "Séries", "Rôles", "Bibliothèques"],
+            details,
+            stretch_from=0,
+        )
+
+    def set_author_composite_choice(self, choice: str) -> None:
+        row = self._selected_row_data(self.author_cleanup_table)
+        if not isinstance(row, dict):
+            QMessageBox.information(self, "Auteurs composites", "Sélectionnez d'abord une ligne contenant « / ».")
+            return
+        parts = [str(value or "").strip() for value in row.get("composite_parts") or [] if str(value or "").strip()]
+        suggestions = [str(value or "").strip() for value in row.get("composite_suggestions") or [] if str(value or "").strip()]
+        if len(parts) < 2:
+            QMessageBox.information(self, "Auteurs composites", "La ligne sélectionnée n'est pas une valeur composite exploitable.")
+            return
+        if choice == "left":
+            replacement = [suggestions[0] if len(suggestions) == len(parts) else parts[0]]
+        elif choice == "right":
+            replacement = [suggestions[-1] if len(suggestions) == len(parts) else parts[-1]]
+        elif choice == "split":
+            replacement = suggestions if len(suggestions) == len(parts) else parts
+        else:
+            variants = row.get("variants") if isinstance(row.get("variants"), list) else []
+            replacement = [str((variants[0] if variants else {}).get("name") or "").strip()]
+        replacement = [value for value in replacement if value]
+        group_id = str(row.get("group_id") or "")
+        display = " + ".join(replacement) if len(replacement) > 1 else (replacement[0] if replacement else "")
+        self.author_cleanup_replacements[group_id] = replacement
+        self.author_cleanup_canonicals[group_id] = display
+        if choice == "keep":
+            self.author_cleanup_checked.discard(group_id)
+        else:
+            self.author_cleanup_checked.add(group_id)
+        self.author_cleanup_book_changes = []
+        self.author_cleanup_preview_mappings = {}
+        self.author_cleanup_preview_pending_decisions = []
+        self.author_cleanup_preview_ready = False
+        self.refresh_author_cleanup_table()
+
+    def select_safe_author_cleanup_rows(self) -> None:
+        self.author_cleanup_checked = {
+            str(row.get("group_id") or "") for row in self.author_cleanup_rows if bool(row.get("safe"))
+        }
+        self.author_cleanup_book_changes = []
+        self.author_cleanup_preview_mappings = {}
+        self.author_cleanup_preview_pending_decisions = []
+        self.author_cleanup_preview_ready = False
+        self.refresh_author_cleanup_table()
+
+    def _selected_author_cleanup_groups(self) -> List[tuple[Dict[str, Any], Any]]:
+        selected: List[tuple[Dict[str, Any], Any]] = []
+        for row in self.author_cleanup_rows:
+            group_id = str(row.get("group_id") or "")
+            if group_id not in self.author_cleanup_checked:
+                continue
+            replacements = self.author_cleanup_replacements.get(group_id) or [
+                self.author_cleanup_canonicals.get(group_id, str(row.get("canonical") or "")).strip()
+            ]
+            replacements = [str(value or "").strip() for value in replacements if str(value or "").strip()]
+            if replacements:
+                selected.append((row, replacements if len(replacements) > 1 else replacements[0]))
+        return selected
+
+    @staticmethod
+    def _author_entries_text(entries: Any) -> str:
+        return " | ".join(
+            f"{entry.get('name', '')} [{entry.get('role', '')}]"
+            for entry in entries if isinstance(entry, dict)
+        )
+
+    def preview_author_cleanup(self) -> None:
+        selected = self._selected_author_cleanup_groups()
+        if not selected:
+            QMessageBox.information(self, "Nettoyage des auteurs", "Aucune correction sélectionnée.")
+            return
+        mappings: Dict[str, Any] = {}
+        series_ids: set[str] = set()
+        stored_mappings = self.author_canonical_store.mappings()
+        pending_decisions: List[tuple[Dict[str, Any], Any]] = []
+        for group, canonical in selected:
+            mappings.update(author_mapping_for_group(group, canonical))
+            aliases = [
+                str(item.get("name") or "")
+                for item in group.get("variants") or []
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            if not author_decision_is_remembered(aliases, canonical, stored_mappings):
+                pending_decisions.append((group, canonical))
+            series_ids.update(str(item.get("id") or "") for item in group.get("series") or [] if isinstance(item, dict))
+
+        def preview() -> List[Dict[str, Any]]:
+            api = self.komga_api()
+            changes: List[Dict[str, Any]] = []
+            seen_books: set[str] = set()
+            for series_id in sorted(series_ids):
+                if not series_id:
+                    continue
+                for book in api.books(series_id=series_id, page_size=500, direct_series_only=True):
+                    change = analyze_book_author_change(book, mappings)
+                    book_id = str(change.get("book_id") or "")
+                    if change.get("changed") and book_id and book_id not in seen_books:
+                        seen_books.add(book_id)
+                        changes.append(change)
+            return changes
+
+        def done(changes: List[Dict[str, Any]]) -> None:
+            self.author_cleanup_book_changes = list(changes)
+            self.author_cleanup_preview_mappings = dict(mappings)
+            self.author_cleanup_preview_pending_decisions = list(pending_decisions)
+            self.author_cleanup_preview_ready = True
+            locked = sum(1 for row in changes if row.get("locked"))
+            lines = [
+                f"{len(selected)} groupe(s) sélectionné(s).",
+                f"{len(changes) - locked} tome(s) modifiable(s) · {locked} verrouillé(s).",
+                f"{len(pending_decisions)} nouvelle(s) décision(s) canonique(s) à mémoriser.",
+                "",
+                "Aucune écriture n'est encore effectuée.",
+                "",
+            ]
+            if not changes and not pending_decisions:
+                lines[1:4] = [
+                    "Prévisualisation réussie : tous les tomes et toutes les décisions sont déjà conformes.",
+                    "Aucune application n'est nécessaire.",
+                    "",
+                ]
+            for row in changes[:400]:
+                suffix = " — VERROUILLÉ" if row.get("locked") else ""
+                lines.append(f"{row.get('number', '')} {row.get('title', '')}{suffix}")
+                lines.append(f"  Avant : {self._author_entries_text(row.get('current') or [])}")
+                lines.append(f"  Après : {self._author_entries_text(row.get('proposed') or [])}")
+                lines.append("")
+            if len(changes) > 400:
+                lines.append(f"… {len(changes) - 400} autre(s) tome(s) non affiché(s).")
+            self._show_text_popup("Auteurs — prévisualisation", "\n".join(lines), (1200, 800))
+
+        self.run_worker("Prévisualisation du nettoyage des auteurs", preview, done)
+
+    def apply_author_cleanup(self) -> None:
+        selected = self._selected_author_cleanup_groups()
+        if not selected:
+            QMessageBox.information(self, "Nettoyage des auteurs", "Aucune correction sélectionnée.")
+            return
+        if not self.author_cleanup_preview_ready or not self.author_cleanup_preview_mappings:
+            QMessageBox.information(
+                self,
+                "Nettoyage des auteurs",
+                "Prévisualisez d'abord la sélection. L'application réutilisera exactement cette proposition.",
+            )
+            return
+        simulation = self.simulation_enabled()
+        writable = sum(1 for row in self.author_cleanup_book_changes if not row.get("locked"))
+        pending_decisions = list(self.author_cleanup_preview_pending_decisions)
+        if not writable and not pending_decisions:
+            locked = sum(1 for row in self.author_cleanup_book_changes if row.get("locked"))
+            detail = (
+                f"{locked} tome(s) restent verrouillé(s), mais aucune action applicable n'est disponible."
+                if locked else
+                "Tous les tomes et toutes les décisions canoniques sélectionnés sont déjà conformes."
+            )
+            QMessageBox.information(
+                self,
+                "Nettoyage des auteurs",
+                "La prévisualisation a bien abouti. " + detail + "\n\nAucune application n'est nécessaire.",
+            )
+            return
+        actions: List[str] = []
+        if writable:
+            actions.append(f"modifier réellement les auteurs de {writable} tome(s)")
+        if pending_decisions:
+            actions.append(f"mémoriser {len(pending_decisions)} nouvelle(s) décision(s) canonique(s)")
+        confirmation = "Confirmer : " + " et ".join(actions) + " ?\n\n"
+        if not simulation and QMessageBox.question(
+            self,
+            "Confirmer le nettoyage des auteurs",
+            confirmation + "Les rôles seront conservés et une sauvegarde restaurable sera créée avant chaque modification de tome.",
+        ) != QMessageBox.Yes:
+            return
+        preview_ids = {str(row.get("book_id") or "") for row in self.author_cleanup_book_changes if not row.get("locked")}
+        mappings = dict(self.author_cleanup_preview_mappings)
+
+        def apply_rows() -> List[Dict[str, Any]]:
+            api = self.komga_api()
+            report: List[Dict[str, Any]] = []
+            for book_id in sorted(preview_ids):
+                entity = api.get_book(book_id)
+                fresh = analyze_book_author_change(entity, mappings)
+                if fresh.get("locked"):
+                    report.append({"book_id": book_id, "status": "Ignoré", "reason": "Auteurs verrouillés"})
+                    continue
+                if not fresh.get("changed"):
+                    report.append({"book_id": book_id, "status": "Ignoré", "reason": "Déjà conforme"})
+                    continue
+                if simulation:
+                    report.append({"book_id": book_id, "status": "Simulation", "reason": "Aucune écriture"})
+                    continue
+                current = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+                self._write_metadata_update(
+                    api,
+                    "book",
+                    book_id,
+                    {"authors": fresh.get("proposed") or []},
+                    current=current,
+                    source="cleanup_authors_desktop",
+                    note="normalisation des auteurs au format Prénom Nom",
+                )
+                report.append({"book_id": book_id, "status": "Appliqué", "reason": "OK"})
+            return report
+
+        def done(report: List[Dict[str, Any]]) -> None:
+            applied = sum(1 for row in report if row.get("status") in {"Appliqué", "Simulation"})
+            skipped = len(report) - applied
+            remembered = 0
+            if not simulation:
+                for group, canonical in pending_decisions:
+                    self.author_canonical_store.remember(
+                        [str(item.get("name") or "") for item in group.get("variants") or [] if isinstance(item, dict)],
+                        canonical,
+                    )
+                    remembered += 1
+            self._invalidate_book_cache()
+            QMessageBox.information(
+                self,
+                "Nettoyage des auteurs terminé",
+                f"{applied} tome(s) {'simulé(s)' if simulation else 'modifié(s)'} · {skipped} ignoré(s) · "
+                f"{remembered} décision(s) mémorisée(s).",
+            )
+            self.run_author_cleanup_scan()
+
+        self.run_worker("Application du nettoyage des auteurs", apply_rows, done)
+
+    def _build_language_cleanup_subtab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        intro = QLabel(
+            "Analyse les langues des séries et des tomes. Bedetheque utilise exactement la colonne language du CSV ; "
+            "Manga News propose FR, MangaBaka et ComicVine proposent EN. Les normalisations et correspondances CSV "
+            "exactes sont sûres ; les conflits restent à vérifier."
+        )
+        intro.setWordWrap(True)
+        intro.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        layout.addWidget(intro)
+
+        controls = QGridLayout()
+        controls.setHorizontalSpacing(10)
+        controls.setVerticalSpacing(8)
+        self.language_cleanup_library_combo = self._make_library_combo("cleanup_languages")
+        self.language_cleanup_library_combo.setMinimumWidth(160)
+        self.language_cleanup_library_combo.setMaximumWidth(340)
+        self.language_cleanup_scope = QComboBox()
+        self.language_cleanup_scope.addItem("Séries", "series")
+        self.language_cleanup_scope.addItem("Tomes", "books")
+        self.language_cleanup_scope.addItem("Séries et tomes", "both")
+        self.language_cleanup_scope.setMaximumWidth(170)
+        self.language_cleanup_current_filter = QComboBox()
+        for label, value in (("Toutes langues", ""), ("Vide", "__EMPTY__"), ("FR", "fr"), ("EN", "en"), ("JA", "ja"), ("Autres", "__OTHER__")):
+            self.language_cleanup_current_filter.addItem(label, value)
+        self.language_cleanup_current_filter.setMaximumWidth(150)
+        self.language_cleanup_source_filter = QComboBox()
+        self.language_cleanup_source_filter.addItem("Toutes sources", "")
+        self.language_cleanup_source_filter.addItem("Sans source", "__EMPTY__")
+        for source in LANGUAGE_CLEANUP_SOURCES:
+            self.language_cleanup_source_filter.addItem(source, source)
+        self.language_cleanup_source_filter.setMaximumWidth(170)
+        self.language_cleanup_hide_chapters = QCheckBox("Masquer les séries (Chap)")
+        self.language_cleanup_hide_chapters.setChecked(True)
+        self.language_cleanup_only_changes = QCheckBox("Afficher uniquement les changements")
+        self.language_cleanup_only_changes.setChecked(False)
+        self.language_cleanup_analyze_button = QPushButton("Analyser")
+        self.language_cleanup_select_safe_button = QPushButton("Sélectionner les corrections sûres")
+        self.language_cleanup_preview_button = QPushButton("Prévisualiser la sélection")
+        self.language_cleanup_apply_button = QPushButton("Valider et appliquer")
+        controls.addWidget(QLabel("Bibliothèque"), 0, 0)
+        controls.addWidget(self.language_cleanup_library_combo, 0, 1)
+        controls.addWidget(QLabel("Cibles"), 0, 2)
+        controls.addWidget(self.language_cleanup_scope, 0, 3)
+        controls.addWidget(QLabel("Langue actuelle"), 0, 4)
+        controls.addWidget(self.language_cleanup_current_filter, 0, 5)
+        controls.addWidget(QLabel("Source"), 0, 6)
+        controls.addWidget(self.language_cleanup_source_filter, 0, 7)
+        controls.addWidget(self.language_cleanup_analyze_button, 0, 8)
+        controls.addWidget(self.language_cleanup_hide_chapters, 1, 0, 1, 2)
+        controls.addWidget(self.language_cleanup_only_changes, 1, 2, 1, 3)
+        controls.addWidget(self.language_cleanup_select_safe_button, 1, 6)
+        controls.addWidget(self.language_cleanup_preview_button, 1, 7)
+        controls.addWidget(self.language_cleanup_apply_button, 1, 8)
+        controls.setColumnStretch(1, 2)
+        controls.setColumnStretch(5, 1)
+        layout.addLayout(controls)
+
+        self.language_cleanup_summary_label = QLabel("Aucune analyse lancée.")
+        self.language_cleanup_summary_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.language_cleanup_summary_label)
+        policy = QLabel(
+            "SÛR = normalisation ou correspondance Bedetheque exacte, cochée automatiquement. "
+            "PROBABLE = une seule source d’édition cohérente, laissée à valider. Les conflits, valeurs verrouillées "
+            "et propositions absentes ne sont jamais appliqués automatiquement. La colonne Proposé reste modifiable. "
+            "Cochez la première case puis faites Maj+clic sur la dernière : toute la plage visible prend le même état."
+        )
+        policy.setWordWrap(True)
+        policy.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        policy.setStyleSheet("padding: 8px; border: 1px solid #496b8f; background: #25384c;")
+        layout.addWidget(policy)
+
+        self.language_cleanup_table = QTableWidget()
+        self._register_table(self.language_cleanup_table, "cleanup.languages.v2")
+        self.language_cleanup_table.setProperty("komgaDisableViewportFill", True)
+        self.language_cleanup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.language_cleanup_table.viewport().installEventFilter(self)
+        layout.addWidget(self.language_cleanup_table, 1)
+
+        self.language_cleanup_analyze_button.clicked.connect(self.run_language_cleanup_scan)
+        self.language_cleanup_select_safe_button.clicked.connect(self.select_safe_language_cleanup_rows)
+        self.language_cleanup_preview_button.clicked.connect(self.preview_language_cleanup)
+        self.language_cleanup_apply_button.clicked.connect(self.apply_language_cleanup)
+        self.language_cleanup_only_changes.toggled.connect(self.refresh_language_cleanup_table)
+        self.language_cleanup_current_filter.currentIndexChanged.connect(self.refresh_language_cleanup_table)
+        self.language_cleanup_source_filter.currentIndexChanged.connect(self.refresh_language_cleanup_table)
+        self.language_cleanup_hide_chapters.toggled.connect(self.refresh_language_cleanup_table)
+        self.language_cleanup_table.itemChanged.connect(self._on_language_cleanup_item_changed)
+        return tab
+
+    def run_language_cleanup_scan(self) -> None:
+        library_id = self._library_id("cleanup_languages")
+        scope = str(self.language_cleanup_scope.currentData() or "series")
+
+        def scan() -> List[Dict[str, Any]]:
+            series = self._cached_series(library_id=library_id or None, page_size=500, max_age_seconds=60.0)
+            books: List[Any] = []
+            if scope in {"books", "both"}:
+                books = self.komga_api().books(library_id=library_id or None, page_size=1000)
+            try:
+                bedetheque_languages = self.bedetheque_csv_client().language_map()
+            except Exception:
+                bedetheque_languages = {}
+            return scan_language_cleanup(
+                series,
+                books,
+                bedetheque_languages=bedetheque_languages,
+                include_series=scope in {"series", "both"},
+                include_books=scope in {"books", "both"},
+            )
+
+        def done(rows: List[Dict[str, Any]]) -> None:
+            self.language_cleanup_rows = list(rows)
+            self.language_cleanup_checked_ids = {
+                self._language_cleanup_row_key(row)
+                for row in rows
+                if row.get("confidence") == "safe"
+                and row.get("changed")
+                and not row.get("locked")
+                and not (
+                    self.language_cleanup_hide_chapters.isChecked()
+                    and is_chapter_series_title(row.get("series_title"))
+                )
+            }
+            self.language_cleanup_proposals = {
+                self._language_cleanup_row_key(row): str(row.get("proposed_language") or "")
+                for row in rows
+            }
+            self.language_cleanup_range_anchor = ""
+            self.refresh_language_cleanup_table()
+            changed = sum(1 for row in rows if row.get("changed"))
+            safe = sum(1 for row in rows if row.get("confidence") == "safe" and row.get("changed"))
+            likely = sum(1 for row in rows if row.get("confidence") == "likely" and row.get("changed"))
+            review = sum(1 for row in rows if row.get("confidence") == "review")
+            locked = sum(1 for row in rows if row.get("confidence") == "locked")
+            self.language_cleanup_summary_label.setText(
+                f"{len(rows)} cible(s) analysée(s) · {changed} changement(s) · {safe} sûr(s) · "
+                f"{likely} probable(s) · {review} à vérifier · {locked} verrouillée(s)."
+            )
+
+        self.run_worker("Analyse des langues", scan, done)
+
+    @staticmethod
+    def _language_cleanup_confidence_label(value: Any) -> str:
+        return {
+            "safe": "Sûr",
+            "likely": "Probable",
+            "review": "À vérifier",
+            "locked": "Verrouillé",
+            "unchanged": "Aucun changement",
+        }.get(str(value or ""), str(value or ""))
+
+    @staticmethod
+    def _language_cleanup_row_key(row: Dict[str, Any]) -> str:
+        return f"{row.get('target_type') or ''}:{row.get('target_id') or ''}"
+
+    def _filtered_language_cleanup_rows(self) -> List[Dict[str, Any]]:
+        language_filter = str(self.language_cleanup_current_filter.currentData() or "")
+        source_filter = str(self.language_cleanup_source_filter.currentData() or "")
+        rows: List[Dict[str, Any]] = []
+        for row in self.language_cleanup_rows:
+            if self.language_cleanup_only_changes.isChecked() and not row.get("changed"):
+                continue
+            if self.language_cleanup_hide_chapters.isChecked() and is_chapter_series_title(row.get("series_title")):
+                continue
+            current = str(row.get("current_language") or "")
+            if language_filter == "__EMPTY__" and current:
+                continue
+            if language_filter == "__OTHER__" and (not current or current in {"fr", "en", "ja"}):
+                continue
+            if language_filter not in {"", "__EMPTY__", "__OTHER__"} and current != language_filter:
+                continue
+            linked_sources = {str(value) for value in row.get("linked_sources") or []}
+            if source_filter == "__EMPTY__" and linked_sources:
+                continue
+            if source_filter not in {"", "__EMPTY__"} and source_filter not in linked_sources:
+                continue
+            rows.append(row)
+        return rows
+
+    def _capture_language_cleanup_table_state(self) -> None:
+        if not hasattr(self, "language_cleanup_table") or self.language_cleanup_table.columnCount() <= 0:
+            return
+        headers = self._table_headers(self.language_cleanup_table)
+        proposed_column = headers.index("Proposé") if "Proposé" in headers else -1
+        for index in range(self.language_cleanup_table.rowCount()):
+            first = self.language_cleanup_table.item(index, 0)
+            data = first.data(Qt.UserRole) if first is not None else None
+            if not isinstance(data, dict):
+                continue
+            key = self._language_cleanup_row_key(data)
+            if proposed_column >= 0:
+                proposed_item = self.language_cleanup_table.item(index, proposed_column)
+                if proposed_item is not None:
+                    self.language_cleanup_proposals[key] = proposed_item.text().strip()
+
+    def _update_language_cleanup_selection_label(self) -> None:
+        count = len(self.language_cleanup_checked_ids)
+        if hasattr(self, "language_cleanup_preview_button"):
+            suffix = f" ({count})" if count else ""
+            self.language_cleanup_preview_button.setText(f"Prévisualiser la sélection{suffix}")
+
+    def _on_language_cleanup_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._language_cleanup_refreshing or item is None:
+            return
+        first = self.language_cleanup_table.item(item.row(), 0)
+        data = first.data(Qt.UserRole) if first is not None else None
+        if not isinstance(data, dict):
+            return
+        key = self._language_cleanup_row_key(data)
+        headers = self._table_headers(self.language_cleanup_table)
+        if item.column() == 0:
+            if item.checkState() == Qt.Checked and not data.get("locked"):
+                self.language_cleanup_checked_ids.add(key)
+            else:
+                self.language_cleanup_checked_ids.discard(key)
+            self.language_cleanup_range_anchor = key
+            self._update_language_cleanup_selection_label()
+        elif item.column() < len(headers) and headers[item.column()] == "Proposé":
+            self.language_cleanup_proposals[key] = item.text().strip()
+
+    def _toggle_language_cleanup_range(self, row_index: int, *, shift: bool) -> None:
+        table = self.language_cleanup_table
+        first = table.item(row_index, 0)
+        data = first.data(Qt.UserRole) if first is not None else None
+        if not isinstance(data, dict) or data.get("locked"):
+            return
+        key = self._language_cleanup_row_key(data)
+        desired_checked = key not in self.language_cleanup_checked_ids
+        start = end = row_index
+        anchor_found = False
+        if shift and self.language_cleanup_range_anchor:
+            for index in range(table.rowCount()):
+                anchor_item = table.item(index, 0)
+                anchor_data = anchor_item.data(Qt.UserRole) if anchor_item is not None else None
+                if isinstance(anchor_data, dict) and self._language_cleanup_row_key(anchor_data) == self.language_cleanup_range_anchor:
+                    start, end = sorted((index, row_index))
+                    anchor_found = True
+                    break
+        self._language_cleanup_refreshing = True
+        try:
+            for index in range(start, end + 1):
+                check = table.item(index, 0)
+                row = check.data(Qt.UserRole) if check is not None else None
+                if check is None or not isinstance(row, dict) or row.get("locked"):
+                    continue
+                row_key = self._language_cleanup_row_key(row)
+                if desired_checked:
+                    self.language_cleanup_checked_ids.add(row_key)
+                else:
+                    self.language_cleanup_checked_ids.discard(row_key)
+                check.setCheckState(Qt.Checked if desired_checked else Qt.Unchecked)
+        finally:
+            self._language_cleanup_refreshing = False
+        if not shift or not anchor_found:
+            self.language_cleanup_range_anchor = key
+        self._update_language_cleanup_selection_label()
+
+    def _apply_language_cleanup_default_columns(self) -> None:
+        table = self.language_cleanup_table
+        state = self._table_state_root().get(self._table_key(table))
+        if isinstance(state, dict) and state:
+            return
+        widths = {
+            "Appliquer": 85, "Titre": 320, "Actuel": 75, "Valeur brute": 110,
+            "Proposé": 85, "Sources": 150, "Confiance": 105, "Raison": 360,
+            "Type": 75, "Série": 280,
+        }
+        self._restoring_table_ui_state = True
+        try:
+            for index, header in enumerate(self._table_headers(table)):
+                table.setColumnWidth(index, widths.get(header, 120))
+        finally:
+            self._restoring_table_ui_state = False
+
+    def refresh_language_cleanup_table(self) -> None:
+        if not hasattr(self, "language_cleanup_table"):
+            return
+        self._capture_language_cleanup_table_state()
+        rows = self._filtered_language_cleanup_rows()
+        self._language_cleanup_refreshing = True
+        try:
+            self._set_table(
+                self.language_cleanup_table,
+                ["Appliquer", "Titre", "Actuel", "Valeur brute", "Proposé", "Sources", "Confiance", "Raison", "Type", "Série"],
+                [[
+                    "", row.get("title"), row.get("current_language") or "—", row.get("current_raw") or "—",
+                    self.language_cleanup_proposals.get(self._language_cleanup_row_key(row), str(row.get("proposed_language") or "")),
+                    ", ".join(row.get("linked_sources") or []) or "—",
+                    self._language_cleanup_confidence_label(row.get("confidence")), row.get("reason"),
+                    "Série" if row.get("target_type") == "series" else "Tome", row.get("series_title"),
+                ] for row in rows],
+                selection_mode=QAbstractItemView.ExtendedSelection,
+                row_data=rows,
+            )
+            self._apply_language_cleanup_default_columns()
+            for index, row in enumerate(rows):
+                check = self.language_cleanup_table.item(index, 0)
+                if check is not None:
+                    check.setFlags(check.flags() | Qt.ItemIsUserCheckable)
+                    check.setCheckState(
+                        Qt.Checked
+                        if self._language_cleanup_row_key(row) in self.language_cleanup_checked_ids
+                        else Qt.Unchecked
+                    )
+                    if row.get("locked"):
+                        check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+                for column in range(self.language_cleanup_table.columnCount()):
+                    item = self.language_cleanup_table.item(index, column)
+                    if item is not None and column != 4:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        finally:
+            self._language_cleanup_refreshing = False
+        self._update_language_cleanup_selection_label()
+
+    def _checked_language_cleanup_rows(self) -> List[Dict[str, Any]]:
+        self._capture_language_cleanup_table_state()
+        rows: List[Dict[str, Any]] = []
+        for data in self.language_cleanup_rows:
+            key = self._language_cleanup_row_key(data)
+            if key not in self.language_cleanup_checked_ids or data.get("locked"):
+                continue
+            proposed = normalize_cleanup_language(
+                self.language_cleanup_proposals.get(key, data.get("proposed_language"))
+            )
+            if proposed:
+                selected = dict(data)
+                selected["proposed_language"] = proposed
+                rows.append(selected)
+        return rows
+
+    def select_safe_language_cleanup_rows(self) -> None:
+        self.language_cleanup_checked_ids = {
+            self._language_cleanup_row_key(row)
+            for row in self._filtered_language_cleanup_rows()
+            if row.get("confidence") == "safe" and row.get("changed") and not row.get("locked")
+        }
+        self.language_cleanup_range_anchor = ""
+        self.refresh_language_cleanup_table()
+
+    def preview_language_cleanup(self) -> None:
+        rows = self._checked_language_cleanup_rows()
+        if not rows:
+            QMessageBox.information(self, "Nettoyage des langues", "Aucune correction valide sélectionnée.")
+            return
+        text = [f"{len(rows)} modification(s) sélectionnée(s).", "", "Aucune écriture n’est encore effectuée.", ""]
+        for row in rows:
+            target = "Série" if row.get("target_type") == "series" else "Tome"
+            text.append(
+                f"{target} · {row.get('series_title')} · {row.get('title')} : "
+                f"{row.get('current_language') or '—'} → {row.get('proposed_language')} ({row.get('source') or 'manuel'})"
+            )
+        self._show_text_popup("Langues — prévisualisation", "\n".join(text), (1100, 760))
+
+    def apply_language_cleanup(self) -> None:
+        selected = self._checked_language_cleanup_rows()
+        if not selected:
+            QMessageBox.information(self, "Nettoyage des langues", "Aucune correction valide sélectionnée.")
+            return
+        simulation = self.simulation_enabled()
+        if not simulation and QMessageBox.question(
+            self,
+            "Confirmer le nettoyage des langues",
+            f"Modifier réellement {len(selected)} cible(s) ?\n\nUne sauvegarde restaurable sera créée avant chaque écriture.",
+        ) != QMessageBox.Yes:
+            return
+
+        def apply_rows() -> List[Dict[str, Any]]:
+            api = self.komga_api()
+            report: List[Dict[str, Any]] = []
+            for row in selected:
+                target_type = str(row.get("target_type") or "")
+                target_id = str(row.get("target_id") or "")
+                proposed = normalize_cleanup_language(row.get("proposed_language"))
+                if target_type not in {"series", "book"} or not target_id or not proposed:
+                    report.append({"status": "Ignorée", "reason": "Cible ou langue invalide"})
+                    continue
+                entity = api.get_series(target_id) if target_type == "series" else api.get_book(target_id)
+                current = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+                if current.get("languageLock"):
+                    report.append({"status": "Ignorée", "reason": "Champ language verrouillé"})
+                    continue
+                if normalize_cleanup_language(current.get("language")) == proposed:
+                    report.append({"status": "Ignorée", "reason": "Déjà conforme"})
+                    continue
+                if simulation:
+                    report.append({"status": "Simulation", "reason": "Aucune écriture"})
+                    continue
+                self._write_metadata_update(
+                    api,
+                    target_type,
+                    target_id,
+                    {"language": proposed},
+                    current=current,
+                    source="cleanup_languages_desktop",
+                    note="nettoyage et normalisation de language",
+                    allow_all_languages=True,
+                )
+                report.append({"status": "Appliquée", "reason": "OK"})
+            return report
+
+        def done(report: List[Dict[str, Any]]) -> None:
+            applied = sum(1 for row in report if row.get("status") in {"Appliquée", "Simulation"})
+            skipped = len(report) - applied
+            self._invalidate_series_cache()
+            self._invalidate_book_cache()
+            QMessageBox.information(
+                self,
+                "Nettoyage des langues terminé",
+                f"{applied} cible(s) {'simulée(s)' if simulation else 'modifiée(s)'} · {skipped} ignorée(s).",
+            )
+            self.run_language_cleanup_scan()
+
+        self.run_worker("Application du nettoyage des langues", apply_rows, done)
+
+    def _build_chapter_cleanup_subtab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        intro = QLabel(
+            "Détecte les séries physiques nommées Chap et propose le nom du dossier parent suivi de (Chap). "
+            "Les niveaux EN/FR/JA et les marqueurs (EN), (FR), (JA) ou (INT) sont nettoyés ; une langue "
+            "détectée est reportée dans les métadonnées. Aucun livre ni dossier n'est modifié."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        controls = QHBoxLayout()
+        self.chapter_cleanup_library_combo = self._make_library_combo("cleanup_chapters")
+        self.chapter_cleanup_only_changes = QCheckBox("Afficher uniquement les séries à modifier")
+        self.chapter_cleanup_only_changes.setChecked(True)
+        btn_analyze = QPushButton("Analyser")
+        btn_select = QPushButton("Sélectionner les corrections sûres")
+        btn_preview = QPushButton("Prévisualiser la sélection")
+        btn_apply = QPushButton("Valider et appliquer")
+        controls.addWidget(QLabel("Bibliothèque"))
+        controls.addWidget(self.chapter_cleanup_library_combo)
+        controls.addWidget(self.chapter_cleanup_only_changes)
+        controls.addWidget(btn_analyze)
+        controls.addWidget(btn_select)
+        controls.addWidget(btn_preview)
+        controls.addWidget(btn_apply)
+        layout.addLayout(controls)
+
+        self.chapter_cleanup_summary_label = QLabel("Aucune analyse lancée.")
+        self.chapter_cleanup_summary_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.chapter_cleanup_summary_label)
+        policy = QLabel(
+            "Les corrections sûres sont cochées automatiquement. Les doublons, collisions et conflits de langue "
+            "restent décochés mais peuvent être inclus manuellement après contrôle. Les champs verrouillés ne sont jamais écrits."
+        )
+        policy.setWordWrap(True)
+        policy.setStyleSheet("padding: 8px; border: 1px solid #496b8f; background: #25384c;")
+        layout.addWidget(policy)
+
+        self.chapter_cleanup_table = QTableWidget()
+        self._register_table(self.chapter_cleanup_table, "cleanup.chapter_series")
+        self.chapter_cleanup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.chapter_cleanup_table, 1)
+
+        btn_analyze.clicked.connect(self.run_chapter_cleanup_scan)
+        btn_select.clicked.connect(self.select_safe_chapter_cleanup_rows)
+        btn_preview.clicked.connect(self.preview_chapter_cleanup)
+        btn_apply.clicked.connect(self.apply_chapter_cleanup)
+        self.chapter_cleanup_only_changes.toggled.connect(self.refresh_chapter_cleanup_table)
+        return tab
+
+    def run_chapter_cleanup_scan(self) -> None:
+        library_id = self._library_id("cleanup_chapters")
+
+        def scan() -> List[Dict[str, Any]]:
+            return scan_chapter_series(
+                self._cached_series(library_id=library_id or None, page_size=500, max_age_seconds=60.0)
+            )
+
+        def done(rows: List[Dict[str, Any]]) -> None:
+            self.chapter_cleanup_rows = list(rows)
+            self.refresh_chapter_cleanup_table()
+            counts: Dict[str, int] = {}
+            for row in rows:
+                status = str(row.get("status") or "")
+                counts[status] = counts.get(status, 0) + 1
+            self.chapter_cleanup_summary_label.setText(
+                f"{len(rows)} série(s) Chap · {counts.get('ready', 0)} correction(s) sûre(s) · "
+                f"{counts.get('unchanged', 0)} déjà conforme(s) · {counts.get('locked', 0)} verrouillée(s) · "
+                f"{counts.get('duplicate', 0) + counts.get('collision', 0) + counts.get('review', 0)} à vérifier."
+            )
+
+        self.run_worker("Analyse des séries Chap", scan, done)
+
+    @staticmethod
+    def _chapter_cleanup_status_label(status: Any) -> str:
+        return {
+            "ready": "Prête",
+            "unchanged": "Déjà conforme",
+            "locked": "Verrouillée",
+            "review": "À vérifier",
+            "duplicate": "Doublon",
+            "collision": "Collision",
+        }.get(str(status or ""), str(status or ""))
+
+    def refresh_chapter_cleanup_table(self) -> None:
+        rows = [
+            row for row in self.chapter_cleanup_rows
+            if not self.chapter_cleanup_only_changes.isChecked() or row.get("changed")
+        ]
+        self._set_table(
+            self.chapter_cleanup_table,
+            [
+                "Appliquer", "Titre actuel", "Titre de tri actuel", "Chemin Komga", "Parent détecté",
+                "Titre proposé", "Langue", "Statut", "Raison",
+            ],
+            [[
+                "", row.get("current_title"), row.get("current_title_sort"), row.get("path"), row.get("base_title"),
+                row.get("proposed_title"),
+                f"{row.get('current_language') or '—'} → {row.get('proposed_language') or '—'}",
+                self._chapter_cleanup_status_label(row.get("status")), row.get("reason"),
+            ] for row in rows],
+            selection_mode=QAbstractItemView.ExtendedSelection,
+            row_data=rows,
+        )
+        for index, row in enumerate(rows):
+            item = self.chapter_cleanup_table.item(index, 0)
+            if item is None:
+                continue
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            status = str(row.get("status") or "")
+            item.setCheckState(Qt.Checked if status == "ready" else Qt.Unchecked)
+            if status in {"locked", "unchanged"} or not row.get("changed"):
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+
+    def _checked_chapter_cleanup_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for index in range(self.chapter_cleanup_table.rowCount()):
+            item = self.chapter_cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if item is not None and item.checkState() == Qt.Checked and isinstance(data, dict):
+                rows.append(data)
+        return rows
+
+    def select_safe_chapter_cleanup_rows(self) -> None:
+        for index in range(self.chapter_cleanup_table.rowCount()):
+            item = self.chapter_cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if item is not None and isinstance(data, dict) and item.flags() & Qt.ItemIsEnabled:
+                item.setCheckState(Qt.Checked if data.get("status") == "ready" else Qt.Unchecked)
+
+    def preview_chapter_cleanup(self) -> None:
+        rows = self._checked_chapter_cleanup_rows()
+        if not rows:
+            QMessageBox.information(self, "Séries Chap", "Aucune correction sélectionnée.")
+            return
+        text = [
+            f"{len(rows)} série(s) sélectionnée(s).",
+            "",
+            "Aucune écriture n'est encore effectuée.",
+            "",
+        ]
+        for row in rows:
+            text.append(f"{row.get('current_title')}  →  {row.get('proposed_title')}")
+            text.append(f"  Chemin : {row.get('path')}")
+            for field, value in (row.get("payload") or {}).items():
+                text.append(f"  {field} : {value}")
+            text.append("")
+        self._show_text_popup("Séries Chap — prévisualisation", "\n".join(text), (1150, 760))
+
+    def apply_chapter_cleanup(self) -> None:
+        selected = self._checked_chapter_cleanup_rows()
+        if not selected:
+            QMessageBox.information(self, "Séries Chap", "Aucune correction sélectionnée.")
+            return
+        simulation = self.simulation_enabled()
+        if not simulation and QMessageBox.question(
+            self,
+            "Confirmer le traitement des séries Chap",
+            f"Modifier réellement {len(selected)} série(s) ?\n\n"
+            "Seuls title, titleSort et éventuellement language seront écrits. "
+            "Une sauvegarde restaurable sera créée avant chaque modification.",
+        ) != QMessageBox.Yes:
+            return
+
+        def apply_rows() -> List[Dict[str, Any]]:
+            api = self.komga_api()
+            report: List[Dict[str, Any]] = []
+            for selected_row in selected:
+                series_id = str(selected_row.get("series_id") or "")
+                entity = api.get_series(series_id)
+                fresh = analyze_chapter_series_item(entity)
+                if fresh is None or fresh.get("path") != selected_row.get("path"):
+                    report.append({"series_id": series_id, "status": "Ignorée", "reason": "Chemin modifié"})
+                    continue
+                if fresh.get("proposed_title") != selected_row.get("proposed_title"):
+                    report.append({"series_id": series_id, "status": "Ignorée", "reason": "Proposition devenue différente"})
+                    continue
+                if fresh.get("status") in {"locked", "unchanged"} or not fresh.get("payload"):
+                    report.append({"series_id": series_id, "status": "Ignorée", "reason": fresh.get("reason")})
+                    continue
+                if fresh.get("status") == "review" and selected_row.get("status") != "review":
+                    report.append({"series_id": series_id, "status": "Ignorée", "reason": fresh.get("reason")})
+                    continue
+                if simulation:
+                    report.append({"series_id": series_id, "status": "Simulation", "reason": "Aucune écriture"})
+                    continue
+                current = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+                self._write_metadata_update(
+                    api,
+                    "series",
+                    series_id,
+                    dict(fresh.get("payload") or {}),
+                    current=current,
+                    source="cleanup_chapter_series_desktop",
+                    note="renommage série Chap depuis le chemin Komga",
+                )
+                report.append({"series_id": series_id, "status": "Appliquée", "reason": "OK"})
+            return report
+
+        def done(report: List[Dict[str, Any]]) -> None:
+            applied = sum(1 for row in report if row.get("status") in {"Appliquée", "Simulation"})
+            skipped = len(report) - applied
+            self._invalidate_series_cache()
+            QMessageBox.information(
+                self,
+                "Traitement des séries Chap terminé",
+                f"{applied} série(s) {'simulée(s)' if simulation else 'modifiée(s)'} · {skipped} ignorée(s).",
+            )
+            self.run_chapter_cleanup_scan()
+
+        self.run_worker("Application des séries Chap", apply_rows, done)
+
+    def run_alternate_title_cleanup_scan(self) -> None:
+        library_id = self._library_id("cleanup")
+        days = int(self.cleanup_added_filter.currentData() or 0)
+
+        def scan() -> List[Dict[str, Any]]:
+            rows = scan_series_alternate_titles(self.komga_api().series(library_id=library_id or None, page_size=500))
+            if not days:
+                return rows
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            filtered: List[Dict[str, Any]] = []
+            for row in rows:
+                try:
+                    added = datetime.fromisoformat(str(row.get("added_at") or "").replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if added >= cutoff:
+                    filtered.append(row)
+            return filtered
+
+        def done(rows: List[Dict[str, Any]]) -> None:
+            self.cleanup_rows = list(rows)
+            self.refresh_alternate_title_cleanup_table()
+            changed = sum(1 for row in rows if row["changed"] and not row["locked"])
+            reviews = sum(int(row["review_count"]) for row in rows)
+            self.cleanup_summary_label.setText(
+                f"{len(rows)} série(s) avec titres alternatifs · {changed} correction(s) sûre(s) · "
+                f"{reviews} titre(s) ambigu(s) conservé(s)."
+            )
+            self._set_table(self.cleanup_detail_table, ["Titre", "Label", "Décision", "Langue", "Raison"], [])
+
+        self.run_worker("Analyse du nettoyage", scan, done)
+
+    def refresh_alternate_title_cleanup_table(self) -> None:
+        rows = [row for row in self.cleanup_rows if not self.cleanup_only_changes.isChecked() or row.get("changed")]
+        self._set_table(
+            self.cleanup_table,
+            ["Appliquer", "Série", "Statut", "Ajout Komga", "Actuels", "Conservés", "À retirer", "À vérifier", "Verrouillé"],
+            [[
+                "", row["title"],
+                (f"À revoir ({row['review_count']})" if row.get("review_count") else ("Prête" if row.get("changed") else "Aucun changement")),
+                str(row.get("added_at") or "")[:10], row["current_count"], row["kept_count"], row["removed_count"],
+                row["review_count"], "Oui" if row["locked"] else "Non",
+            ] for row in rows],
+            selection_mode=QAbstractItemView.ExtendedSelection,
+            row_data=rows,
+        )
+        for index, row in enumerate(rows):
+            item = self.cleanup_table.item(index, 0)
+            if item is None:
+                continue
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if row.get("changed") and not row.get("locked") else Qt.Unchecked)
+            if row.get("locked") or not row.get("changed"):
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+
+    def _selected_cleanup_series_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for index in self._selected_row_indexes(self.cleanup_table):
+            item = self.cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if isinstance(data, dict):
+                rows.append(data)
+        return rows
+
+    def show_cleanup_series_context_menu(self, position: Any) -> None:
+        clicked = self.cleanup_table.indexAt(position)
+        if clicked.isValid() and clicked.row() not in self._selected_row_indexes(self.cleanup_table):
+            self.cleanup_table.clearSelection()
+            self.cleanup_table.selectRow(clicked.row())
+        rows = self._selected_cleanup_series_rows()
+        if not rows:
+            return
+        review_count = sum(int(row.get("review_count") or 0) for row in rows)
+        menu = QMenu(self)
+        open_action = menu.addAction("Traiter la série dans le panneau de détails")
+        open_action.setEnabled(len(rows) == 1)
+        open_action.triggered.connect(self.show_alternate_title_cleanup_detail)
+        menu.addSeparator()
+        review_menu = menu.addMenu(f"Traiter les titres en REVIEW ({review_count})")
+        for label, decision in (
+            ("Classer comme japonais (JA)", "keep_ja"),
+            ("Classer comme français (FR)", "keep_fr"),
+            ("Classer comme anglais (EN)", "keep_en"),
+            ("Retirer", "remove"),
+        ):
+            action = review_menu.addAction(label)
+            action.setEnabled(review_count > 0)
+            action.triggered.connect(lambda _checked=False, value=decision: self.set_cleanup_series_review_decision(value))
+        menu.addSeparator()
+        include_action = menu.addAction("Inclure les séries modifiées dans l’application")
+        include_action.triggered.connect(lambda: self.set_cleanup_series_apply_checked(True))
+        exclude_action = menu.addAction("Exclure de l’application")
+        exclude_action.triggered.connect(lambda: self.set_cleanup_series_apply_checked(False))
+        menu.exec(self.cleanup_table.viewport().mapToGlobal(position))
+
+    def set_cleanup_series_apply_checked(self, checked: bool) -> None:
+        selected_ids = {row.get("series_id") for row in self._selected_cleanup_series_rows()}
+        for index in range(self.cleanup_table.rowCount()):
+            item = self.cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if isinstance(data, dict) and data.get("series_id") in selected_ids and item.flags() & Qt.ItemIsEnabled:
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def set_cleanup_series_review_decision(self, decision: str) -> None:
+        rows = self._selected_cleanup_series_rows()
+        review_count = sum(int(row.get("review_count") or 0) for row in rows)
+        if not rows or not review_count:
+            return
+        verb = {
+            "keep_ja": "classer comme japonais",
+            "keep_fr": "classer comme français",
+            "keep_en": "classer comme anglais",
+            "remove": "retirer",
+        }.get(decision, decision)
+        if QMessageBox.question(
+            self,
+            "Confirmer le traitement des REVIEW",
+            f"{verb.capitalize()} {review_count} titre(s) en REVIEW dans {len(rows)} série(s) ?\n\n"
+            "Cette décision sera visible dans l’avant/après puis écrite uniquement après « Valider et appliquer ».",
+        ) != QMessageBox.Yes:
+            return
+        selected_ids = {row.get("series_id") for row in rows}
+        for row in rows:
+            overrides = dict(row.get("overrides") or {})
+            for finding in row.get("findings") or []:
+                if finding.get("action") == "review":
+                    overrides[int(finding.get("index") or 0)] = decision
+            analysis = analyze_alternate_titles(
+                row.get("current") or [],
+                primary_title=str(row.get("title") or ""),
+                locked=bool(row.get("locked")),
+                overrides=overrides,
+            )
+            row.update(analysis)
+            row["overrides"] = overrides
+        self.refresh_alternate_title_cleanup_table()
+        for index in range(self.cleanup_table.rowCount()):
+            item = self.cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if isinstance(data, dict) and data.get("series_id") in selected_ids:
+                self.cleanup_table.selectRow(index)
+                if data.get("changed") and not data.get("locked"):
+                    item.setCheckState(Qt.Checked)
+        remaining = sum(int(row.get("review_count") or 0) for row in self.cleanup_rows)
+        self.cleanup_summary_label.setText(
+            f"Décision confirmée pour {review_count} titre(s) dans {len(rows)} série(s). "
+            f"REVIEW restant(s) : {remaining}."
+        )
+
+    def _checked_cleanup_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for index in range(self.cleanup_table.rowCount()):
+            item = self.cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if item is not None and item.checkState() == Qt.Checked and isinstance(data, dict):
+                rows.append(data)
+        return rows
+
+    def select_safe_cleanup_rows(self) -> None:
+        for index in range(self.cleanup_table.rowCount()):
+            item = self.cleanup_table.item(index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if item is not None and isinstance(data, dict) and item.flags() & Qt.ItemIsEnabled:
+                item.setCheckState(Qt.Checked if data.get("changed") and not data.get("locked") else Qt.Unchecked)
+
+    def show_alternate_title_cleanup_detail(self) -> None:
+        row = self._selected_row_data(self.cleanup_table)
+        if not isinstance(row, dict):
+            return
+        findings = list(row.get("findings") or [])
+        self._set_table(
+            self.cleanup_detail_table,
+            ["Titre", "Label", "Décision", "Langue", "Raison"],
+            [[finding.get("title"), finding.get("label"), str(finding.get("action") or "").upper(), finding.get("language"), finding.get("reason")] for finding in findings],
+            selection_mode=QAbstractItemView.ExtendedSelection,
+            row_data=findings,
+        )
+        self.cleanup_detail_table.setWordWrap(True)
+        self.cleanup_detail_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+
+    def show_cleanup_title_context_menu(self, position: Any) -> None:
+        clicked = self.cleanup_detail_table.indexAt(position)
+        if clicked.isValid() and clicked.row() not in self._selected_row_indexes(self.cleanup_detail_table):
+            self.cleanup_detail_table.clearSelection()
+            self.cleanup_detail_table.selectRow(clicked.row())
+        series_row = self._selected_row_data(self.cleanup_table)
+        indexes = self._selected_row_indexes(self.cleanup_detail_table)
+        if not isinstance(series_row, dict) or not indexes:
+            return
+        menu = QMenu(self)
+        actions = [
+            ("Conserver comme japonais (JA)", "keep_ja"),
+            ("Conserver comme français (FR)", "keep_fr"),
+            ("Conserver comme anglais (EN)", "keep_en"),
+            ("Retirer", "remove"),
+            ("Rétablir la décision automatique", "auto"),
+        ]
+        for label, decision in actions:
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, value=decision: self.set_cleanup_title_decision(value))
+        menu.exec(self.cleanup_detail_table.viewport().mapToGlobal(position))
+
+    def set_cleanup_title_decision(self, decision: str) -> None:
+        row = self._selected_row_data(self.cleanup_table)
+        selected_indexes = self._selected_row_indexes(self.cleanup_detail_table)
+        if not isinstance(row, dict) or not selected_indexes:
+            return
+        if decision == "remove" and QMessageBox.question(
+            self,
+            "Confirmer le retrait",
+            f"Retirer {len(selected_indexes)} titre(s) alternatif(s) de la série « {row.get('title', '')} » ?\n\n"
+            "La suppression ne sera écrite qu’après « Valider et appliquer ».",
+        ) != QMessageBox.Yes:
+            return
+        overrides = dict(row.get("overrides") or {})
+        for table_index in selected_indexes:
+            item = self.cleanup_detail_table.item(table_index, 0)
+            finding = item.data(Qt.UserRole) if item is not None else None
+            finding_index = int(finding.get("index")) if isinstance(finding, dict) else table_index
+            if decision == "auto":
+                overrides.pop(finding_index, None)
+            else:
+                overrides[finding_index] = decision
+        analysis = analyze_alternate_titles(
+            row.get("current") or [],
+            primary_title=str(row.get("title") or ""),
+            locked=bool(row.get("locked")),
+            overrides=overrides,
+        )
+        row.update(analysis)
+        row["overrides"] = overrides
+        series_id = row.get("series_id")
+        self.refresh_alternate_title_cleanup_table()
+        for table_index in range(self.cleanup_table.rowCount()):
+            item = self.cleanup_table.item(table_index, 0)
+            data = item.data(Qt.UserRole) if item is not None else None
+            if isinstance(data, dict) and data.get("series_id") == series_id:
+                self.cleanup_table.selectRow(table_index)
+                if data.get("changed") and not data.get("locked"):
+                    item.setCheckState(Qt.Checked)
+                break
+        remaining = int(row.get("review_count") or 0)
+        self.cleanup_summary_label.setText(
+            f"Décision appliquée à {len(selected_indexes)} titre(s) de « {row.get('title', '')} ». "
+            f"REVIEW restant(s) dans cette série : {remaining}."
+        )
+
+    def preview_alternate_title_cleanup(self) -> None:
+        rows = self._checked_cleanup_rows()
+        if not rows:
+            QMessageBox.information(self, "Nettoyage", "Aucune correction sûre sélectionnée.")
+            return
+        text = [f"{len(rows)} série(s) sélectionnée(s).", "", "Aucune écriture n’est encore effectuée.", ""]
+        unresolved = sum(int(row.get("review_count") or 0) for row in rows)
+        text.extend([
+            f"Titres encore en REVIEW : {unresolved}",
+            "Ces titres seront conservés strictement inchangés.",
+            "",
+        ])
+        for row in rows:
+            text.append(f"{row.get('title')} : {row.get('current_count')} → {len(row.get('proposed') or [])} titres")
+            for finding in row.get("removed") or []:
+                text.append(f"  RETIRER [{finding.get('label')}] {finding.get('title')}")
+        self._show_text_popup("Nettoyage — prévisualisation globale", "\n".join(text), (1050, 720))
+
+    def apply_alternate_title_cleanup(self) -> None:
+        selected = self._checked_cleanup_rows()
+        if not selected:
+            QMessageBox.information(self, "Nettoyage", "Aucune correction sûre sélectionnée.")
+            return
+        simulation = self.simulation_enabled()
+        unresolved = sum(int(row.get("review_count") or 0) for row in selected)
+        if not simulation and QMessageBox.question(
+            self,
+            "Confirmer le nettoyage",
+            f"Appliquer réellement le nettoyage à {len(selected)} série(s) ?\n\n"
+            "Une sauvegarde de restauration et un audit seront créés avant chaque écriture.\n\n"
+            f"{unresolved} titre(s) restent en REVIEW : ils seront conservés strictement inchangés.",
+        ) != QMessageBox.Yes:
+            return
+
+        def apply_rows() -> List[Dict[str, Any]]:
+            api = self.komga_api()
+            report: List[Dict[str, Any]] = []
+            for selected_row in selected:
+                series_id = str(selected_row.get("series_id") or "")
+                entity = api.get_series(series_id)
+                current, title, analysis = analyze_series_entity_alternate_titles(
+                    entity,
+                    fallback_title=str(selected_row.get("title") or ""),
+                    overrides=dict(selected_row.get("overrides") or {}),
+                )
+                if analysis["locked"] or not analysis["changed"]:
+                    report.append({"series_id": series_id, "title": title, "status": "Ignoré"})
+                    continue
+                if simulation:
+                    report.append({"series_id": series_id, "title": title, "status": "Simulation"})
+                    continue
+                self._write_metadata_update(
+                    api,
+                    "series",
+                    series_id,
+                    {"alternateTitles": analysis["proposed"]},
+                    current=current,
+                    source="cleanup_alternate_titles_desktop",
+                    note="nettoyage titres alternatifs FR/EN/JA",
+                )
+                report.append({"series_id": series_id, "title": title, "status": "Appliqué"})
+            return report
+
+        def done(report: List[Dict[str, Any]]) -> None:
+            applied = sum(1 for row in report if row["status"] in {"Appliqué", "Simulation"})
+            QMessageBox.information(
+                self,
+                "Nettoyage terminé",
+                f"{applied} série(s) {'simulée(s)' if simulation else 'nettoyée(s)'}."
+            )
+            self.run_alternate_title_cleanup_scan()
+
+        self.run_worker("Application du nettoyage", apply_rows, done)
+
+    # ------------------------------------------------------------------
     # Suivi sorties
     # ------------------------------------------------------------------
     def _build_release_tracking_tab(self) -> None:
@@ -8569,14 +11737,18 @@ class MainWindow(QMainWindow):
         self.rt_search_series_text.setPlaceholderText("Filtrer séries Komga...")
         self.rt_filter_empty_summary = QCheckBox("Résumé vide")
         self.rt_filter_empty_summary.setToolTip("Afficher uniquement les séries dont le résumé est vide")
+        self.rt_filter_hide_chapters = QCheckBox("Masquer les séries (Chap)")
+        self.rt_filter_hide_chapters.setToolTip("Masquer les séries dont le titre se termine par (Chap) ou (Chapitre)")
         self.rt_filter_language = QComboBox()
         self.rt_filter_language.setMinimumWidth(80)
         self.rt_filter_language.addItem("Toutes", "")
         self.rt_filter_language.addItem("FR", "fr")
         self.rt_filter_language.addItem("EN", "en")
+        self.rt_filter_language.addItem("JA", "ja")
         self.rt_filter_status = QComboBox()
         self.rt_filter_status.setMinimumWidth(105)
         self.rt_filter_status.addItem("Tous", "ALL")
+        self.rt_filter_status.addItem("Tout non terminé", "NOT_ENDED")
         for status in SERIES_STATUS_VALUES:
             self.rt_filter_status.addItem(status, status)
         self.rt_filter_status.addItem("VIDE", "VIDE")
@@ -8584,6 +11756,8 @@ class MainWindow(QMainWindow):
         self.rt_filter_link_label.setMinimumWidth(160)
         self.rt_filter_link_label.addItem("Tous", "ALL")
         self.rt_filter_link_label.addItem("Sans lien", "__NO_LINK__")
+        for label in CANONICAL_SOURCE_LINK_LABELS:
+            self.rt_filter_link_label.addItem(label, label)
         btn_rt_load_libs = QPushButton("Charger bibliothèques")
         btn_rt_load_series = QPushButton("Charger séries")
 
@@ -8594,12 +11768,13 @@ class MainWindow(QMainWindow):
         series_controls.addWidget(btn_rt_load_series, 0, 6)
         series_controls.addWidget(QLabel("Filtres"), 1, 0)
         series_controls.addWidget(self.rt_filter_empty_summary, 1, 1)
-        series_controls.addWidget(QLabel("Langue"), 1, 2)
-        series_controls.addWidget(self.rt_filter_language, 1, 3)
-        series_controls.addWidget(QLabel("Statut"), 1, 4)
-        series_controls.addWidget(self.rt_filter_status, 1, 5)
-        series_controls.addWidget(QLabel("Liens"), 1, 6)
-        series_controls.addWidget(self.rt_filter_link_label, 1, 7)
+        series_controls.addWidget(self.rt_filter_hide_chapters, 1, 2)
+        series_controls.addWidget(QLabel("Langue"), 1, 3)
+        series_controls.addWidget(self.rt_filter_language, 1, 4)
+        series_controls.addWidget(QLabel("Statut"), 1, 5)
+        series_controls.addWidget(self.rt_filter_status, 1, 6)
+        series_controls.addWidget(QLabel("Liens"), 1, 7)
+        series_controls.addWidget(self.rt_filter_link_label, 1, 8)
         series_layout.addLayout(series_controls)
 
         self.rt_series_table = QTableWidget()
@@ -8655,6 +11830,7 @@ class MainWindow(QMainWindow):
         self.rt_library_combo.currentIndexChanged.connect(lambda *_: self.load_release_tracking_series())
         self.rt_search_series_text.returnPressed.connect(self.load_release_tracking_series)
         self.rt_filter_empty_summary.stateChanged.connect(lambda *_: self._apply_release_tracking_series_filters())
+        self.rt_filter_hide_chapters.stateChanged.connect(lambda *_: self._apply_release_tracking_series_filters())
         self.rt_filter_language.currentIndexChanged.connect(lambda *_: self._apply_release_tracking_series_filters())
         self.rt_filter_status.currentIndexChanged.connect(lambda *_: self._apply_release_tracking_series_filters())
         self.rt_filter_link_label.currentIndexChanged.connect(lambda *_: self._apply_release_tracking_series_filters())
@@ -8697,7 +11873,7 @@ class MainWindow(QMainWindow):
                 f"{counts.get('visible', 0)} affichée(s) après filtres locaux"
             )
 
-        self.run_worker("Suivi sorties — chargement séries", lambda: self.komga_api().series(lib_id, search=search, page_size=200), done)
+        self.run_worker("Suivi sorties — chargement séries", lambda: self._cached_series(lib_id, search=search), done)
 
     def _apply_release_tracking_series_filters(self) -> None:
         if not hasattr(self, "rt_series_table"):
@@ -8705,12 +11881,20 @@ class MainWindow(QMainWindow):
         rows = list(self.rt_series_unfiltered_rows or [])
         received = len(rows)
         active_filters: List[str] = []
-        hidden_summary = hidden_language = hidden_status = hidden_link = 0
+        hidden_summary = hidden_chapters = hidden_language = hidden_status = hidden_link = 0
         if self.rt_filter_empty_summary.isChecked():
             before = len(rows)
             rows = [x for x in rows if is_blank_metadata_value((getattr(x, "metadata", {}) or {}).get("summary"))]
             hidden_summary = before - len(rows)
             active_filters.append("résumé vide")
+        if self.rt_filter_hide_chapters.isChecked():
+            before = len(rows)
+            rows = [
+                x for x in rows
+                if not re.search(r"\(\s*chap(?:itre)?s?\s*\)\s*$", str(getattr(x, "title", "") or ""), re.IGNORECASE)
+            ]
+            hidden_chapters = before - len(rows)
+            active_filters.append("séries (Chap) masquées")
         language_filter = self.rt_filter_language.currentData() or ""
         if language_filter:
             before = len(rows)
@@ -8734,6 +11918,7 @@ class MainWindow(QMainWindow):
             "received": received,
             "visible": len(rows),
             "hidden_summary": hidden_summary,
+            "hidden_chapters": hidden_chapters,
             "hidden_language": hidden_language,
             "hidden_status": hidden_status,
             "hidden_link": hidden_link,
@@ -8914,7 +12099,7 @@ class MainWindow(QMainWindow):
         self,
         provider: str,
         link_entry: Dict[str, str],
-        bdt_client: BedethequeClient,
+        bdt_client: BedethequeCsvClient,
         mbk_client: MangaBakaClient,
         mn_client: MangaNewsClient,
         cv_client: ComicVineClient,
@@ -8991,7 +12176,7 @@ class MainWindow(QMainWindow):
         series: Any,
         current: Dict[str, Any],
         source_mode: str,
-        bdt_client: BedethequeClient,
+        bdt_client: BedethequeCsvClient,
         mbk_client: MangaBakaClient,
         mn_client: MangaNewsClient,
         cv_client: ComicVineClient,
@@ -9142,9 +12327,6 @@ class MainWindow(QMainWindow):
         if source_mode == "comicvine" and not self.comicvine_api_key.text().strip():
             QMessageBox.warning(self, "Suivi sorties", "Clé API ComicVine absente.")
             return
-        if self.bdt_csv_only.isChecked() and source_mode == "auto":
-            source_mode = "bedetheque"
-            self.log("ℹ️ CSV uniquement actif : le suivi sorties utilise exclusivement le CSV Bedetheque.")
         total = len(selected_series)
         if hasattr(self, "rt_workflow_status_label"):
             self.rt_workflow_status_label.setText(
@@ -9943,9 +13125,8 @@ class MainWindow(QMainWindow):
         self.komf_url.setText(self.config.komf.url)
         self.komf_enabled.setChecked(bool(self.config.komf.enabled))
         self.komf_timeout_seconds.setValue(int(self.config.komf.timeout_seconds))
-        self.bdt_csv_only.setChecked(self.config.bedetheque.mode == "csv")
         self.bdt_csv_path.setText(self.config.bedetheque.csv_path)
-        self.on_bedetheque_source_changed()
+        self.nautiljon_csv_path.setText(self.config.nautiljon.csv_path)
         self.mangabaka_base_url.setText(self.config.mangabaka.url)
         self.mangabaka_enabled.setChecked(bool(self.config.mangabaka.enabled))
         self.mangabaka_timeout_seconds.setValue(int(self.config.mangabaka.timeout_seconds))
@@ -9963,6 +13144,12 @@ class MainWindow(QMainWindow):
         self.comicvine_api_key.setText(self.config.comicvine.api_key)
         self.comicvine_cache_enabled.setChecked(bool(self.config.comicvine.cache_enabled))
         self.comicvine_cache_dir.setText(self.config.comicvine.cache_dir)
+        self.metron_base_url.setText(self.config.metron.url)
+        self.metron_enabled.setChecked(bool(self.config.metron.enabled))
+        self.metron_timeout_seconds.setValue(int(self.config.metron.timeout_seconds))
+        self.metron_token.setText(self.config.metron.token)
+        self.metron_cache_enabled.setChecked(bool(self.config.metron.cache_enabled))
+        self.metron_cache_dir.setText(self.config.metron.cache_dir)
         self.matching_title_score_min.setValue(float(self.config.matching.title_score_min))
         self.matching_loaded_title_score_min.setValue(float(self.config.matching.loaded_title_score_min))
         self.matching_exact_title_score_min.setValue(float(self.config.matching.exact_title_score_min))
@@ -10025,8 +13212,10 @@ class MainWindow(QMainWindow):
                 "timeout_seconds": self.komf_timeout_seconds.value(),
             },
             "bedetheque": {
-                "mode": "csv" if self.bdt_csv_only.isChecked() else "web",
                 "csv_path": self.bdt_csv_path.text().strip(),
+            },
+            "nautiljon": {
+                "csv_path": self.nautiljon_csv_path.text().strip(),
             },
             "mangabaka": {
                 "url": self.mangabaka_base_url.text().strip() or DEFAULT_API_BASE_URL,
@@ -10050,6 +13239,14 @@ class MainWindow(QMainWindow):
                 "api_key": self.comicvine_api_key.text().strip(),
                 "cache_enabled": self.comicvine_cache_enabled.isChecked(),
                 "cache_dir": self.comicvine_cache_dir.text().strip() or ".komga_db_tool_cache/comicvine",
+            },
+            "metron": {
+                "url": self.metron_base_url.text().strip() or DEFAULT_METRON_API_BASE_URL,
+                "enabled": self.metron_enabled.isChecked(),
+                "timeout_seconds": self.metron_timeout_seconds.value(),
+                "token": self.metron_token.text().strip(),
+                "cache_enabled": self.metron_cache_enabled.isChecked(),
+                "cache_dir": self.metron_cache_dir.text().strip() or ".komga_db_tool_cache/metron",
             },
             "matching": {
                 "title_score_min": self.matching_title_score_min.value(),
@@ -10108,11 +13305,31 @@ class MainWindow(QMainWindow):
             return
         self.run_worker("Test ComicVine", lambda: self.comicvine_client().test(), lambda r: self.log(f"✅ {r}"))
 
+    def test_metron(self) -> None:
+        if not self.metron_token.text().strip():
+            QMessageBox.warning(self, "Metron", "Jeton API Metron absent")
+            return
+        if self._metron_test_in_progress:
+            self.log("⚠️ Un test Metron est déjà en cours ; le doublon a été ignoré.")
+            return
+        self._metron_test_in_progress = True
+        self.run_worker(
+            "Test Metron",
+            lambda: self.metron_client().test(),
+            lambda r: self.log(f"✅ {r}"),
+            lambda: setattr(self, "_metron_test_in_progress", False),
+        )
+
     def load_libraries(self) -> None:
         def done(rows: List[Any]) -> None:
             self._komga_connection_validated = True
+            self._invalidate_series_cache()
+            self._invalidate_book_cache()
+            self._invalidate_all_series_load_generations()
             self.libraries = rows
             self._populate_library_combos()
+            for combo_name in ("bedetheque", "nautiljon", "mangabaka", "manga_news", "comicvine", "metron"):
+                self._clear_source_series_for_library_change(combo_name)
             self._refresh_context_header()
             self.log(f"✅ {len(rows)} bibliothèques chargées dans tous les onglets")
             if self.tabs.currentIndex() == getattr(self, "kora_tab_index", -1):
@@ -10143,6 +13360,7 @@ class MainWindow(QMainWindow):
         if item is not None:
             menu.addSeparator()
         action_bedetheque = menu.addAction("Bedetheque")
+        action_nautiljon = menu.addAction("Nautiljon")
         action_mangabaka = menu.addAction("MangaBaka")
         action_manga_news = menu.addAction("Manga News")
         action_comicvine = menu.addAction("ComicVine")
@@ -10157,6 +13375,8 @@ class MainWindow(QMainWindow):
             self._edit_table_cell_dialog(self.series_table, item)
         elif selected_action == action_bedetheque:
             self.open_explorer_series_in_bedetheque(row)
+        elif selected_action == action_nautiljon:
+            self.open_explorer_series_in_nautiljon(row)
         elif selected_action == action_mangabaka:
             self.open_explorer_series_in_mangabaka(row)
         elif selected_action == action_manga_news:
@@ -10187,7 +13407,7 @@ class MainWindow(QMainWindow):
         generation = self.bdt_context_generation
         self.bdt_target_type.setCurrentText("series")
         self.bdt_target_id.setText(series.id)
-        self.bdt_query.setText(clean_search_title(series.title))
+        self.bdt_query.setText(str(series.title or ""))
         self.bdt_album_number.setText("")
         self._select_bedetheque_komga_series_row_by_id(series.id)
         self._clear_bedetheque_comparison_views(
@@ -10210,7 +13430,21 @@ class MainWindow(QMainWindow):
             self.log(f"✅ Bedetheque : série préchargée depuis l'explorateur — {series.title}")
             self.search_bedetheque()
 
-        self.run_worker("Préchargement Bedetheque depuis l'explorateur", lambda: self.komga_api().books(lib_id, series.id), done)
+        self.run_worker("Préchargement Bedetheque depuis l'explorateur", lambda: self._cached_books(lib_id, series.id), done)
+
+    def open_explorer_series_in_nautiljon(self, row: Optional[int] = None) -> None:
+        if row is None:
+            row = self._selected_row_index(self.series_table)
+        series = self._explorer_series_at_row(row)
+        if series is None:
+            QMessageBox.warning(self, "Nautiljon", "Aucune série Komga sélectionnée dans l'explorateur")
+            return
+        self._set_current_tab_by_title("Nautiljon")
+        self._set_library_combo("nautiljon", getattr(series, "library_id", ""))
+        self._set_context_selection(series=series)
+        self.nautiljon_pending_series_id = str(series.id)
+        self.nautiljon_query.setText(clean_nautiljon_query(series.title))
+        self.load_nautiljon_komga_series()
 
     def open_explorer_series_in_mangabaka(self, row: Optional[int] = None) -> None:
         if row is None:
@@ -10224,7 +13458,7 @@ class MainWindow(QMainWindow):
         self._set_library_combo("mangabaka", getattr(series, "library_id", ""))
         self.mbk_context_generation += 1
         self.mbk_target_id.setText(series.id)
-        self.mbk_query.setText(clean_search_title(series.title))
+        self.mbk_query.setText(mangabaka_search_title(series.title))
         self._select_mangabaka_komga_series_row_by_id(series.id)
         self._clear_mangabaka_views(
             f"Série Komga préchargée depuis l'explorateur : {series.title}\n"
@@ -10244,7 +13478,7 @@ class MainWindow(QMainWindow):
         self._set_library_combo("manga_news", getattr(series, "library_id", ""))
         self.mn_context_generation += 1
         self.mn_target_id.setText(series.id)
-        self.mn_query.setText(clean_search_title(series.title))
+        self.mn_query.setText(str(series.title or ""))
         self._select_manga_news_komga_series_row_by_id(series.id)
         slug, url = self._manga_news_link_for_series(series)
         if slug or url:
@@ -10272,7 +13506,7 @@ class MainWindow(QMainWindow):
         self._set_library_combo("comicvine", getattr(series, "library_id", ""))
         self.cv_context_generation += 1
         self.cv_target_id.setText(series.id)
-        self.cv_query.setText(clean_search_title(series.title))
+        self.cv_query.setText(str(series.title or ""))
         self._select_comicvine_komga_series_row_by_id(series.id)
         volume_id, url = self._comicvine_link_for_series(series)
         if volume_id:
@@ -10292,6 +13526,7 @@ class MainWindow(QMainWindow):
         """Return (slug, url) from an existing Komga Manga-News link when available."""
         metadata = getattr(series, "metadata", {}) if isinstance(getattr(series, "metadata", {}), dict) else {}
         fallback_url = ""
+        fallback_slug = ""
         for entry in metadata_link_entries(metadata.get("links")):
             url = str(entry.get("url") or "").strip()
             if not url:
@@ -10300,10 +13535,13 @@ class MainWindow(QMainWindow):
             url_label = normalized_link_label(_link_label_from_url(url))
             slug = extract_manga_news_series_slug_from_url(url)
             if slug:
-                return slug, url
+                if manga_news_edition_label_from_url(url):
+                    return slug, url
+                if not fallback_slug:
+                    fallback_slug, fallback_url = slug, url
             if (label_norm == "manga_news" or url_label == "manga_news") and not fallback_url:
                 fallback_url = url
-        return "", fallback_url
+        return fallback_slug, fallback_url
 
     def _mangabaka_link_for_series(self, series: Any) -> tuple[str, str]:
         """Return (series_id, url) from an existing Komga MangaBaka link when available."""
@@ -10617,7 +13855,7 @@ class MainWindow(QMainWindow):
                         candidate = bdt_client.scrape_series(url)
                         loaded_title = candidate.series_title
                         candidate_metadata = candidate.series_metadata
-                        backup_payload = {"current": {}, "bedetheque": BedethequeClient.candidate_to_dict(candidate), "payload": {}}
+                        backup_payload = {"current": {}, "bedetheque": candidate_to_dict(candidate), "payload": {}}
                     elif provider == "mangabaka":
                         series_id = extract_mangabaka_series_id_from_url(url)
                         if not series_id:
@@ -10899,7 +14137,7 @@ class MainWindow(QMainWindow):
         query: str,
         series: Any,
         series_results: List[BedethequeSearchResult],
-        client: BedethequeClient,
+        client: BedethequeCsvClient,
         api: KomgaApi,
     ) -> tuple[Optional[BedethequeSearchResult], Optional[BedethequeCandidate], Dict[str, Any]]:
         info: Dict[str, Any] = {
@@ -11096,13 +14334,14 @@ class MainWindow(QMainWindow):
                 "tome_match_detail": "",
                 "payload_fields": "",
                 "payload_json": "",
+                "choices": [],
                 "error": "",
             }
             try:
                 if not query:
                     report["operation_status"] = "Échec : requête vide"
                 else:
-                    search_result = self._search_bedetheque_with_fallback(query, client)
+                    search_result = self._search_bedetheque_with_fallback(title, client)
                     results = search_result.get("rows") or []
                     report["search_query_used"] = str(search_result.get("used_query") or query)
                     report["search_attempts"] = self._format_search_attempts(search_result.get("attempts") or [])
@@ -11163,7 +14402,7 @@ class MainWindow(QMainWindow):
                                 "operation",
                                 "series",
                                 series.id,
-                                {"current": current, "bedetheque": BedethequeClient.candidate_to_dict(candidate), "payload": payload, "source_metadata": source_metadata},
+                                {"current": current, "bedetheque": candidate_to_dict(candidate), "payload": payload, "source_metadata": source_metadata},
                                 "avant PATCH auto-match Bedetheque prudent",
                             )
                             self._write_metadata_update(api, "series", series.id, payload, current, source="auto_match_bedetheque", note="Auto-match Bedetheque prudent")
@@ -11181,7 +14420,6 @@ class MainWindow(QMainWindow):
                 total,
                 f"{index}/{total} — {title} — {report.get('operation_status') or 'traité'}",
             )
-
         csv_name = f"auto_match_bedetheque_prudent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = self.backup.export_csv(csv_name, rows)
         return {"rows": rows, "csv_path": csv_path, "simulation": simulation}
@@ -11379,13 +14617,31 @@ class MainWindow(QMainWindow):
                     report["operation_status"] = "Échec : requête vide"
                 else:
                     direct_slug, direct_url = self._manga_news_link_for_series(series)
+                    base_query, edition_hint = split_manga_news_edition_title(query)
+                    base_query = clean_search_title(base_query)
                     score = 0.0
                     result = None
                     if direct_slug or direct_url:
+                        persisted_edition_label = manga_news_edition_label_from_url(direct_url)
                         report["search_query_used"] = "<lien Manga-News existant>"
                         report["search_attempts"] = "chargement direct"
                         report["result_count"] = 1
-                        if direct_slug:
+                        if persisted_edition_label or edition_hint:
+                            base_slug = direct_slug or series_slug_from_manga_news_url(direct_url)
+                            if not base_slug:
+                                resolved = client.get_series_by_url(direct_url)
+                                base_slug = resolved.slug or series_slug_from_manga_news_url(resolved.source_url)
+                            if persisted_edition_label:
+                                candidate = client.get_series_edition(
+                                    base_slug,
+                                    persisted_edition_label,
+                                    target_title=title,
+                                )
+                            else:
+                                candidate = client.get_series_edition_by_hint(base_slug, edition_hint, target_title=title)
+                            report["matched_slug"] = base_slug
+                            report["search_attempts"] = "chargement direct + groupe d'édition"
+                        elif direct_slug:
                             candidate = client.get_series(direct_slug)
                             report["matched_slug"] = direct_slug
                         else:
@@ -11395,8 +14651,40 @@ class MainWindow(QMainWindow):
                         report["matched_title"] = candidate.title
                         report["match_score"] = "direct-link"
                         loaded_score = title_similarity(query, clean_search_title(candidate.title or title))
+                    elif edition_hint:
+                        edition_results = client.search_editions(query, limit=10)
+                        preferred = [row for row in edition_results if row.edition_preferred]
+                        report["search_query_used"] = base_query
+                        report["search_attempts"] = "recherche groupes d'éditions"
+                        report["result_count"] = len(edition_results)
+                        if len(preferred) != 1:
+                            report["operation_status"] = "Échec : édition explicite introuvable ou ambiguë"
+                            rows.append(report)
+                            self._emit_auto_match_progress(
+                                progress,
+                                "Auto-match Manga News prudent",
+                                index,
+                                total,
+                                f"{index}/{total} — {title} — {report.get('operation_status')}",
+                            )
+                            continue
+                        result = preferred[0]
+                        base_title = str(result.raw.get("base_title") or result.title)
+                        score = title_similarity(base_query, clean_search_title(base_title))
+                        report["match_score"] = f"{score:.3f}"
+                        report["matched_slug"] = result.slug
+                        report["matched_title"] = result.title
+                        report["matched_media_kind"] = result.media_kind
+                        report["matched_url"] = result.url
+                        candidate = client.get_series_edition(
+                            result.slug,
+                            result.edition_label,
+                            target_title=title,
+                            edition_group=result.raw,
+                        )
+                        loaded_score = title_similarity(query, clean_search_title(candidate.title or result.title))
                     else:
-                        search_result = self._search_manga_news_with_fallback(query, True, client)
+                        search_result = self._search_manga_news_with_fallback(title, True, client)
                         results = search_result.get("rows") or []
                         report["search_query_used"] = str(search_result.get("used_query") or query)
                         report["search_attempts"] = self._format_search_attempts(search_result.get("attempts") or [])
@@ -11529,6 +14817,7 @@ class MainWindow(QMainWindow):
                 ("matched_media_kind", "Media"),
                 ("matched_title", "Match"),
                 ("match_score", "Score"),
+                ("second_score", "2e score"),
                 ("loaded_title", "Chargé"),
                 ("loaded_score", "Score chargé"),
                 ("current_series_status", "Status Komga"),
@@ -11547,17 +14836,13 @@ class MainWindow(QMainWindow):
         )
 
 
-    def _mangabaka_auto_match_status(self, query: str, results: List[MangaBakaSearchResult]) -> tuple[Optional[MangaBakaSearchResult], str, float, int]:
-        manga_results = [r for r in results if str(r.type or "").casefold() == "manga"]
-        if not manga_results:
-            return None, "Échec : aucun résultat manga", 0.0, 0
-        if len(manga_results) != 1:
-            return None, "Échec : plusieurs résultats manga", 0.0, len(manga_results)
-        result = manga_results[0]
-        score = title_similarity(clean_search_title(query), clean_search_title(result.title))
-        if score < self._matching_title_score_min():
-            return None, "Échec : score titre insuffisant", score, len(manga_results)
-        return result, "Candidat unique", score, len(manga_results)
+    def _mangabaka_auto_match_status(self, query: str, results: List[MangaBakaSearchResult]) -> tuple[Optional[MangaBakaSearchResult], str, float, float, int]:
+        return select_mangabaka_automatch(
+            query,
+            results,
+            min_score=max(0.90, self._matching_title_score_min()),
+            min_margin=MANGABAKA_AUTOMATCH_MIN_MARGIN,
+        )
 
     def auto_match_mangabaka_prudent_from_explorer(self) -> None:
         selected_series = self._selected_explorer_series_rows()
@@ -11597,6 +14882,299 @@ class MainWindow(QMainWindow):
             done,
         )
 
+    def run_mangabaka_automatch_preview(self, selected_series: List[Any]) -> None:
+        total = len(selected_series)
+        self._set_auto_match_progress("Prévisualisation automatch MangaBaka — démarrage", 0, total)
+        progress = self._auto_match_progress_callback()
+
+        def done(result: Dict[str, Any]) -> None:
+            self._set_auto_match_progress("Prévisualisation automatch MangaBaka — terminée", total, total)
+            self._show_mangabaka_automatch_validation(result)
+
+        self.run_worker(
+            "Prévisualisation automatch MangaBaka",
+            lambda: self._run_auto_match_mangabaka_prudent(selected_series, True, progress),
+            done,
+        )
+
+    def _show_mangabaka_automatch_validation(self, result: Dict[str, Any]) -> None:
+        rows = [row for row in result.get("rows") or [] if isinstance(row, dict)]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Automatch MangaBaka — validation des résultats")
+        dialog.resize(1480, 800)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(
+            "Les correspondances sûres avec modifications sont cochées. "
+            "Décochez toute ligne douteuse avant de valider. Pour un résultat ambigu ou sous 90 %, "
+            "vous pouvez valider explicitement l’un des cinq meilleurs candidats."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        filter_row = QHBoxLayout()
+        hide_no_change = QCheckBox('Masquer les statuts "Aucun changement"')
+        visible_count = QLabel("")
+        filter_row.addWidget(hide_no_change)
+        filter_row.addStretch(1)
+        filter_row.addWidget(visible_count)
+        layout.addLayout(filter_row)
+
+        table = QTableWidget()
+        headers = ["Appliquer", "Série Komga", "Recherche", "Match MangaBaka", "Meilleur", "Deuxième", "Statut", "Champs"]
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        for index, row in enumerate(rows):
+            check = QTableWidgetItem("")
+            check.setFlags((check.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            eligible = bool(row.get("eligible")) and str(row.get("operation_status") or "").startswith("OK")
+            check.setCheckState(Qt.Checked if eligible else Qt.Unchecked)
+            if not eligible:
+                check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+            check.setData(Qt.UserRole, row)
+            table.setItem(index, 0, check)
+            values = [
+                row.get("komga_title", ""),
+                row.get("search_query_used") or row.get("query", ""),
+                row.get("matched_title", ""),
+                row.get("match_score", ""),
+                row.get("second_score", ""),
+                row.get("operation_status", ""),
+                row.get("payload_fields", ""),
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setToolTip(str(value or ""))
+                table.setItem(index, column, item)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setColumnWidth(0, 80)
+        table.setColumnWidth(1, 280)
+        table.setColumnWidth(2, 220)
+        table.setColumnWidth(3, 280)
+        layout.addWidget(table, 1)
+
+        def apply_visibility_filter() -> None:
+            hidden = 0
+            for row_index, row in enumerate(rows):
+                status = str(row.get("operation_status") or row.get("status") or "")
+                should_hide = hide_no_change.isChecked() and "aucun changement" in status.casefold()
+                table.setRowHidden(row_index, should_hide)
+                hidden += int(should_hide)
+            visible_count.setText(f"{len(rows) - hidden}/{len(rows)} ligne(s) affichée(s)")
+
+        hide_no_change.stateChanged.connect(apply_visibility_filter)
+        apply_visibility_filter()
+
+        detail = QTextEdit()
+        detail.setReadOnly(True)
+        detail.setMinimumHeight(180)
+        detail.setStyleSheet("font-family: monospace;")
+        layout.addWidget(detail)
+
+        def update_detail() -> None:
+            selected = table.selectedItems()
+            if not selected:
+                detail.setPlainText("Sélectionnez une ligne pour afficher le détail.")
+                return
+            row = rows[selected[0].row()]
+            detail.setPlainText(json_text(row))
+
+        def apply_manual_choice(row_index: int, selector: QComboBox) -> None:
+            choice = selector.currentData()
+            if not isinstance(choice, dict):
+                return
+            row = rows[row_index]
+            try:
+                candidate = self.mangabaka_client().get_series(str(choice.get("id") or ""))
+                current = self._fetch_current_metadata("series", str(row.get("series_id") or ""))
+                source_metadata, source_notes = self._enrich_update_with_link_series_metadata(
+                    "mangabaka",
+                    candidate,
+                    candidate.series_metadata,
+                )
+                payload = self._payload_from_metadata_maps(
+                    current,
+                    source_metadata,
+                    SERIES_METADATA_FIELDS,
+                    target_type="series",
+                )
+                eligible = bool(payload)
+                row.update(
+                    {
+                        "matched_id": candidate.series_id,
+                        "matched_title": str(choice.get("title") or candidate.title),
+                        "matched_type": str(choice.get("type") or "manga"),
+                        "matched_url": candidate.source_url,
+                        "match_score": f"{float(choice.get('match_score') or 0):.3f}",
+                        "loaded_title": candidate.title,
+                        "loaded_score": f"{mangabaka_match_score(row.get('query') or '', candidate):.3f}",
+                        "source_fields": "; ".join(sorted(source_metadata.keys())),
+                        "source_notes": " | ".join(source_notes),
+                        "source_metadata": source_metadata,
+                        "payload_fields": "; ".join(payload.keys()),
+                        "payload_json": json_text(payload, indent=0) if payload else "",
+                        "eligible": eligible,
+                        "operation_status": "OK choix manuel" if eligible else "OK choix manuel : aucun changement",
+                        "error": "",
+                        "manual_choice": True,
+                    }
+                )
+                self._fill_series_refresh_report_fields(row, current, source_metadata, payload)
+                check = table.item(row_index, 0) or QTableWidgetItem("")
+                check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                check.setCheckState(Qt.Checked if eligible else Qt.Unchecked)
+                if not eligible:
+                    check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+                check.setData(Qt.UserRole, row)
+                table.setItem(row_index, 0, check)
+                for column, value in (
+                    (4, row["match_score"]),
+                    (6, row["operation_status"]),
+                    (7, row["payload_fields"]),
+                ):
+                    item = table.item(row_index, column) or QTableWidgetItem("")
+                    item.setText(str(value or ""))
+                    item.setToolTip(str(value or ""))
+                    table.setItem(row_index, column, item)
+                table.selectRow(row_index)
+                apply_visibility_filter()
+                update_detail()
+            except Exception as exc:
+                row.update({"eligible": False, "operation_status": "Erreur choix manuel", "error": str(exc)})
+                check = table.item(row_index, 0)
+                if check is not None:
+                    check.setCheckState(Qt.Unchecked)
+                    check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+                status_item = table.item(row_index, 6) or QTableWidgetItem("")
+                status_item.setText(str(row["operation_status"]))
+                status_item.setToolTip(str(row.get("error") or ""))
+                table.setItem(row_index, 6, status_item)
+                apply_visibility_filter()
+                update_detail()
+
+        for row_index, row in enumerate(rows):
+            choices = row.get("choices") if isinstance(row.get("choices"), list) else []
+            status = str(row.get("operation_status") or "")
+            manual_status = status.startswith("Échec : score") or status.startswith("À vérifier")
+            if row.get("eligible") or not manual_status or not choices:
+                continue
+            selector = QComboBox(table)
+            selector.addItem("Choisir parmi les 5 meilleurs…", None)
+            for choice in choices[:5]:
+                if not isinstance(choice, dict):
+                    continue
+                label = f"{float(choice.get('match_score') or 0):.3f} — {choice.get('title') or ''}"
+                selector.addItem(label, choice)
+                selector.setItemData(selector.count() - 1, str(choice.get("source_url") or ""), Qt.ToolTipRole)
+            selector.currentIndexChanged.connect(
+                lambda _index, current_row=row_index, current_selector=selector: apply_manual_choice(
+                    current_row,
+                    current_selector,
+                )
+            )
+            table.setCellWidget(row_index, 3, selector)
+
+        table.itemSelectionChanged.connect(update_detail)
+        if rows:
+            table.selectRow(0)
+
+        button_row = QHBoxLayout()
+        select_safe = QPushButton("Sélectionner les correspondances sûres")
+        apply_button = QPushButton("Valider et appliquer la sélection")
+        close_button = QPushButton("Fermer")
+
+        def select_all_safe() -> None:
+            for index, row in enumerate(rows):
+                item = table.item(index, 0)
+                if item and item.flags() & Qt.ItemIsEnabled:
+                    item.setCheckState(Qt.Checked if row.get("eligible") else Qt.Unchecked)
+
+        def apply_checked() -> None:
+            selected_rows = []
+            for index, row in enumerate(rows):
+                item = table.item(index, 0)
+                if item and item.checkState() == Qt.Checked and item.flags() & Qt.ItemIsEnabled:
+                    selected_rows.append(row)
+            if not selected_rows:
+                QMessageBox.warning(dialog, "Automatch MangaBaka", "Aucune correspondance sûre sélectionnée.")
+                return
+            simulation = self.simulation_enabled()
+            if not simulation and QMessageBox.question(
+                dialog,
+                "Confirmer l’automatch MangaBaka",
+                f"Appliquer réellement {len(selected_rows)} série(s) ?\n\nUne sauvegarde restaurable sera créée avant chaque PATCH.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+            dialog.accept()
+
+            def done(applied: Dict[str, Any]) -> None:
+                self._show_auto_match_mangabaka_report(applied)
+                self.leave_mangabaka_automatch_mode()
+
+            self.run_worker(
+                "Application automatch MangaBaka",
+                lambda: self._apply_mangabaka_automatch_rows(selected_rows, simulation),
+                done,
+            )
+
+        select_safe.clicked.connect(select_all_safe)
+        apply_button.clicked.connect(apply_checked)
+        close_button.clicked.connect(dialog.reject)
+        button_row.addWidget(select_safe)
+        button_row.addStretch(1)
+        button_row.addWidget(apply_button)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        dialog.exec()
+
+    def _apply_mangabaka_automatch_rows(self, selected_rows: List[Dict[str, Any]], simulation: bool) -> Dict[str, Any]:
+        api = self.komga_api()
+        applied_rows: List[Dict[str, Any]] = []
+        for source_row in selected_rows:
+            row = dict(source_row)
+            series_id = str(row.get("series_id") or "")
+            source_metadata = row.get("source_metadata") if isinstance(row.get("source_metadata"), dict) else {}
+            try:
+                current = self._fetch_current_metadata("series", series_id)
+                payload = self._payload_from_metadata_maps(current, source_metadata, SERIES_METADATA_FIELDS, target_type="series")
+                row["payload_fields"] = "; ".join(payload.keys())
+                row["payload_json"] = json_text(payload, indent=0) if payload else ""
+                if not payload:
+                    row["operation_status"] = "OK : aucun changement après revalidation"
+                elif simulation:
+                    row["operation_status"] = "OK simulation — aucune écriture"
+                else:
+                    self.backup.save_json(
+                        "operation",
+                        "series",
+                        series_id,
+                        {"current": current, "source_metadata": source_metadata, "payload": payload},
+                        "avant PATCH automatch MangaBaka validé",
+                    )
+                    self._write_metadata_update(
+                        api,
+                        "series",
+                        series_id,
+                        payload,
+                        current,
+                        source="auto_match_mangabaka",
+                        note="Automatch MangaBaka validé",
+                    )
+                    row["operation_status"] = "OK appliqué"
+            except Exception as exc:
+                row["operation_status"] = "Erreur"
+                row["error"] = str(exc)
+            applied_rows.append(row)
+        csv_name = f"auto_match_mangabaka_validated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_path = self.backup.export_csv(csv_name, applied_rows)
+        return {"rows": applied_rows, "csv_path": csv_path, "simulation": simulation}
+
     def _run_auto_match_mangabaka_prudent(
         self,
         selected_series: List[Any],
@@ -11607,10 +15185,11 @@ class MainWindow(QMainWindow):
         api = self.komga_api()
         rows: List[Dict[str, Any]] = []
         total = len(selected_series)
+        provider_blocked = False
 
         for index, series in enumerate(selected_series, start=1):
             title = getattr(series, "title", "")
-            query = clean_search_title(title)
+            query = clean_search_title(mangabaka_search_title(title))
             self.enrichment_history.record_search("mangabaka", getattr(series, "id", ""), title)
             self._emit_auto_match_progress(progress, "Auto-match MangaBaka prudent", index - 1, total, f"{index}/{total} — {title}")
             report: Dict[str, Any] = {
@@ -11627,6 +15206,7 @@ class MainWindow(QMainWindow):
                 "matched_type": "",
                 "matched_url": "",
                 "match_score": "",
+                "second_score": "",
                 "loaded_title": "",
                 "loaded_score": "",
                 "payload_fields": "",
@@ -11637,13 +15217,24 @@ class MainWindow(QMainWindow):
                 if not query:
                     report["operation_status"] = "Échec : requête vide"
                 else:
-                    search_result = self._search_mangabaka_with_fallback(query, True, client)
+                    search_result = self._search_mangabaka_with_fallback(mangabaka_search_title(title), True, client)
                     results = search_result.get("rows") or []
                     report["search_query_used"] = str(search_result.get("used_query") or query)
                     report["search_attempts"] = self._format_search_attempts(search_result.get("attempts") or [])
-                    result, status, score, result_count = self._mangabaka_auto_match_status(query, results)
+                    report["choices"] = [
+                        {
+                            "id": choice.id,
+                            "title": choice.title,
+                            "type": choice.type,
+                            "source_url": choice.source_url,
+                            "match_score": round(choice_score, 6),
+                        }
+                        for choice, choice_score in ranked_mangabaka_choices(query, results, limit=5)
+                    ]
+                    result, status, score, second_score, result_count = self._mangabaka_auto_match_status(query, results)
                     report["result_count"] = result_count
                     report["match_score"] = f"{score:.3f}" if score else ""
+                    report["second_score"] = f"{second_score:.3f}" if second_score else ""
                     if result is None:
                         report["operation_status"] = status
                     else:
@@ -11653,7 +15244,7 @@ class MainWindow(QMainWindow):
                         report["matched_url"] = result.source_url
                         candidate = client.get_series(result.id)
                         report["loaded_title"] = candidate.title
-                        loaded_score = title_similarity(query, clean_search_title(candidate.title or result.title))
+                        loaded_score = mangabaka_match_score(query, candidate)
                         report["loaded_score"] = f"{loaded_score:.3f}"
                         # Le résultat de recherche a déjà passé la règle stricte :
                         # exactement 1 résultat type=manga + score titre >= 0.90.
@@ -11669,6 +15260,8 @@ class MainWindow(QMainWindow):
                             payload = self._payload_from_metadata_maps(current, source_metadata, SERIES_METADATA_FIELDS, target_type="series")
                             report["payload_fields"] = "; ".join(payload.keys())
                             report["payload_json"] = json_text(payload, indent=0) if payload else ""
+                            report["source_metadata"] = source_metadata
+                            report["eligible"] = bool(payload)
                             self._fill_series_refresh_report_fields(report, current, source_metadata, payload)
 
                             if not payload:
@@ -11685,8 +15278,14 @@ class MainWindow(QMainWindow):
                                 )
                                 self._write_metadata_update(api, "series", series.id, payload, current, source="auto_match_mangabaka", note="Auto-match MangaBaka prudent")
                                 report["operation_status"] = "OK appliqué"
-            except ExternalSourceBlocked:
-                raise
+            except ExternalSourceBlocked as exc:
+                # The shared client has already retried the 429 with backoff.
+                # Return the partial preview instead of turning the entire
+                # batch into an exception with no usable result table.
+                provider_blocked = True
+                report["eligible"] = False
+                report["operation_status"] = "Interrompu : limite MangaBaka après nouvelles tentatives"
+                report["error"] = str(exc)
             except Exception as exc:
                 report["operation_status"] = "Erreur"
                 report["error"] = str(exc)
@@ -11698,6 +15297,41 @@ class MainWindow(QMainWindow):
                 total,
                 f"{index}/{total} — {title} — {report.get('operation_status') or 'traité'}",
             )
+            if provider_blocked:
+                for remaining_index, remaining in enumerate(selected_series[index:], start=index + 1):
+                    remaining_title = getattr(remaining, "title", "")
+                    rows.append({
+                        "index": remaining_index,
+                        "series_id": getattr(remaining, "id", ""),
+                        "komga_title": remaining_title,
+                        "query": clean_search_title(mangabaka_search_title(remaining_title)),
+                        "search_query_used": "",
+                        "search_attempts": "",
+                        **self._new_series_refresh_report_fields(),
+                        "result_count": 0,
+                        "matched_id": "",
+                        "matched_title": "",
+                        "matched_type": "",
+                        "matched_url": "",
+                        "match_score": "",
+                        "second_score": "",
+                        "loaded_title": "",
+                        "loaded_score": "",
+                        "payload_fields": "",
+                        "payload_json": "",
+                        "choices": [],
+                        "eligible": False,
+                        "operation_status": "Non traité : limite MangaBaka encore active",
+                        "error": str(report.get("error") or ""),
+                    })
+                self._emit_auto_match_progress(
+                    progress,
+                    "Auto-match MangaBaka prudent",
+                    total,
+                    total,
+                    "Prévisualisation partielle — limite MangaBaka persistante",
+                )
+                break
 
         csv_name = f"auto_match_mangabaka_prudent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = self.backup.export_csv(csv_name, rows)
@@ -11808,7 +15442,7 @@ class MainWindow(QMainWindow):
             )
             suffix = f" — {', '.join(active_filters)}" if active_filters else ""
             self.log(f"✅ {len(rows)} séries chargées{suffix}")
-        self.run_worker("Chargement séries", lambda: self.komga_api().series(lib_id, search=search), done)
+        self.run_worker("Chargement séries", lambda: self._cached_series(lib_id, search=search), done)
 
     def load_books(self, series_id: Optional[str] = None, library_id: Optional[str] = None) -> None:
         lib_id = library_id or self._library_id("explorer")
@@ -11848,7 +15482,7 @@ class MainWindow(QMainWindow):
             self.log(f"✅ {len(rows)} livres chargés{target}")
         self.run_worker(
             "Chargement livres",
-            lambda: self.komga_api().books(
+            lambda: self._cached_books(
                 lib_id,
                 series_id or None,
                 search=search,
@@ -11901,8 +15535,6 @@ class MainWindow(QMainWindow):
         if sid:
             self._set_metadata_target_type("series")
             self.meta_target_id.setText(sid)
-            self.poster_type.setCurrentText("series")
-            self.poster_id.setText(sid)
             if hasattr(self, "komf_series_id"):
                 self.komf_series_id.setText(sid)
                 self.komf_library_id.setText(self._library_id("explorer"))
@@ -11913,10 +15545,11 @@ class MainWindow(QMainWindow):
             if series is None:
                 series = next((item for item in self.series_rows if self._record_id(item) == sid), None)
             if series is not None:
+                self._set_poster_record("series", series, refresh=False)
                 self._set_context_selection(series=series)
-                self.bdt_query.setText(clean_search_title(series.title))
+                self.bdt_query.setText(str(series.title or ""))
                 if hasattr(self, "mbk_query"):
-                    self.mbk_query.setText(clean_search_title(series.title))
+                    self.mbk_query.setText(str(series.title or ""))
                     self.mbk_target_id.setText(sid)
                 self.explorer_current_target_type = "series"
                 self.explorer_current_target_id = sid
@@ -11935,8 +15568,6 @@ class MainWindow(QMainWindow):
         if bid:
             self._set_metadata_target_type("book")
             self.meta_target_id.setText(bid)
-            self.poster_type.setCurrentText("book")
-            self.poster_id.setText(bid)
             self.bdt_target_type.setCurrentText("book")
             self.bdt_target_id.setText(bid)
             selected_data = self._selected_row_data(self.books_table)
@@ -11944,9 +15575,10 @@ class MainWindow(QMainWindow):
             if book is None:
                 book = next((item for item in self.book_rows if self._record_id(item) == bid), None)
             if book is not None:
+                self._set_poster_record("book", book, refresh=False)
                 self._set_context_selection(book=book)
                 self.bdt_album_number.setText(str(book.number or ""))
-                self.bdt_query.setText(clean_search_title(book.title))
+                self.bdt_query.setText(str(book.title or ""))
                 self.explorer_current_target_type = "book"
                 self.explorer_current_target_id = bid
                 self.explorer_current_detail = book.raw or {}
@@ -12157,7 +15789,7 @@ class MainWindow(QMainWindow):
             )
 
         api_call = (
-            (lambda: self.komga_api().series(library_id))
+            (lambda: self._cached_series(library_id))
             if target_type == "series"
             else (lambda: self.komga_api().books(library_id=library_id, page_size=200))
         )
@@ -13403,7 +17035,7 @@ class MainWindow(QMainWindow):
         search = search_widget.text().strip() if search_widget is not None else ""
         generation = self._next_series_load_generation("readlists_library_series")
         def do_load() -> List[Any]:
-            rows = self.komga_api().series(lib_id or None, search=search)
+            rows = self._cached_series(lib_id or None, search=search)
             return self._filter_global_series_visibility(rows)
         def done(rows: List[Any]) -> None:
             if not self._is_current_series_load_generation("readlists_library_series", generation):
@@ -13869,48 +17501,469 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Posters
     # ------------------------------------------------------------------
+    def _load_poster_target_thumbnails_async(
+        self,
+        target_type: str,
+        table: QTableWidget,
+        rows: List[Any],
+    ) -> None:
+        target_ids = [str(getattr(row, "id", "") or "") for row in rows]
+        target_ids = [target_id for target_id in target_ids if target_id]
+        if not target_ids:
+            return
+        generation = int(self._poster_thumbnail_generation.get(target_type, 0)) + 1
+        self._poster_thumbnail_generation[target_type] = generation
+
+        def work() -> Dict[str, bytes]:
+            with self._poster_thumbnail_cache_lock:
+                thumbnails = {
+                    target_id: self._poster_thumbnail_cache[(target_type, target_id)]
+                    for target_id in target_ids
+                    if (target_type, target_id) in self._poster_thumbnail_cache
+                }
+            missing = [target_id for target_id in target_ids if target_id not in thumbnails]
+            if missing:
+                api = self.komga_api()
+
+                def fetch(target_id: str) -> tuple[str, bytes]:
+                    try:
+                        return target_id, api.thumbnail_bytes(target_type, target_id)
+                    except Exception:
+                        return target_id, b""
+
+                with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
+                    futures = [pool.submit(fetch, target_id) for target_id in missing]
+                    for future in as_completed(futures):
+                        target_id, data = future.result()
+                        thumbnails[target_id] = data
+                        with self._poster_thumbnail_cache_lock:
+                            self._poster_thumbnail_cache[(target_type, target_id)] = data
+                with self._poster_thumbnail_cache_lock:
+                    while len(self._poster_thumbnail_cache) > 500:
+                        self._poster_thumbnail_cache.pop(next(iter(self._poster_thumbnail_cache)))
+            return thumbnails
+
+        def done(thumbnails: Dict[str, bytes]) -> None:
+            if self._poster_thumbnail_generation.get(target_type) != generation:
+                return
+            current_rows = self.poster_series_rows if target_type == "series" else self.poster_book_rows
+            if [str(getattr(row, "id", "") or "") for row in current_rows] != target_ids:
+                return
+            for index, target_id in enumerate(target_ids):
+                label = table.cellWidget(index, 0)
+                if not isinstance(label, QLabel):
+                    continue
+                pixmap = QPixmap()
+                pixmap.loadFromData(thumbnails.get(target_id, b""))
+                if not pixmap.isNull():
+                    label.setText("")
+                    label.setPixmap(pixmap.scaled(42, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        self.run_worker(f"Miniatures {target_type} — couvertures", work, done)
+
+    def _fill_poster_target_table(
+        self,
+        table: QTableWidget,
+        headers: List[str],
+        values: List[List[Any]],
+        rows: List[Any],
+        thumbnails: Optional[Dict[str, bytes]] = None,
+    ) -> None:
+        thumbnails = thumbnails or {}
+        self._set_table(table, headers, values, row_data=rows)
+        table.setColumnWidth(0, 64)
+        for index, row in enumerate(rows):
+            label = QLabel("—")
+            label.setAlignment(Qt.AlignCenter)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            pixmap = QPixmap()
+            pixmap.loadFromData(thumbnails.get(str(getattr(row, "id", "") or ""), b""))
+            if not pixmap.isNull():
+                label.setText("")
+                label.setPixmap(pixmap.scaled(42, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            table.setCellWidget(index, 0, label)
+            table.setRowHeight(index, 66)
+
+    def load_poster_series_targets(self, page: int = 0) -> None:
+        if not hasattr(self, "poster_series_table"):
+            return
+        library_id = self._library_id("poster_series")
+        search = self.poster_series_search.text().strip()
+        requested_page = max(0, int(page))
+
+        def work() -> Dict[str, Any]:
+            return self.komga_api().series_page(
+                library_id or None,
+                search=search,
+                page=requested_page,
+                page_size=40,
+            )
+
+        def done(result: Dict[str, Any]) -> None:
+            rows = list(result.get("items") or [])
+            self.poster_series_rows = rows
+            self.poster_series_page = int(result.get("page") or 0)
+            self.poster_series_total_pages = int(result.get("total_pages") or 0)
+            self._fill_poster_target_table(
+                self.poster_series_table,
+                ["Miniature", "Titre", "Tomes", "Langue", "Statut"],
+                [["", row.title, row.book_count, row.metadata.get("language", ""), row.metadata.get("status", "")] for row in rows],
+                rows,
+            )
+            total_pages = max(1, self.poster_series_total_pages)
+            self.poster_series_page_label.setText(
+                f"{int(result.get('total') or 0)} série(s) — page {self.poster_series_page + 1}/{total_pages}"
+            )
+            self.poster_series_prev.setEnabled(self.poster_series_page > 0)
+            self.poster_series_next.setEnabled(not bool(result.get("last", True)))
+            self.log(f"✅ Couvertures : {len(rows)} série(s) affichée(s)")
+            self._load_poster_target_thumbnails_async("series", self.poster_series_table, rows)
+
+        self.run_worker("Recherche séries — couvertures", work, done)
+
+    def on_poster_books_library_changed(self, *_: Any) -> None:
+        if not hasattr(self, "poster_book_series_filter"):
+            return
+        library_id = self._library_id("poster_books")
+
+        self.load_poster_book_targets(0)
+
+        def done(rows: List[Any]) -> None:
+            previous = str(self.poster_book_series_filter.currentData() or "")
+            self.poster_book_series_filter.blockSignals(True)
+            self.poster_book_series_filter.clear()
+            self.poster_book_series_filter.addItem("Toutes les séries", "")
+            for row in rows:
+                self.poster_book_series_filter.addItem(str(row.title or row.id), str(row.id))
+            index = self.poster_book_series_filter.findData(previous)
+            self.poster_book_series_filter.setCurrentIndex(index if index >= 0 else 0)
+            self.poster_book_series_filter.blockSignals(False)
+
+        self.run_worker(
+            "Chargement filtre séries — couvertures",
+            lambda: self._cached_series(library_id or None),
+            done,
+        )
+
+    def load_poster_book_targets(self, page: int = 0) -> None:
+        if not hasattr(self, "poster_books_table"):
+            return
+        library_id = self._library_id("poster_books")
+        series_id = str(self.poster_book_series_filter.currentData() or "")
+        search = self.poster_book_search.text().strip()
+        requested_page = max(0, int(page))
+
+        def work() -> Dict[str, Any]:
+            return self.komga_api().books_page(
+                library_id or None,
+                series_id or None,
+                search=search,
+                page=requested_page,
+                page_size=40,
+            )
+
+        def done(result: Dict[str, Any]) -> None:
+            rows = list(result.get("items") or [])
+            self.poster_book_rows = rows
+            self.poster_book_page = int(result.get("page") or 0)
+            self.poster_book_total_pages = int(result.get("total_pages") or 0)
+            self._fill_poster_target_table(
+                self.poster_books_table,
+                ["Miniature", "Série", "N°", "Titre du tome"],
+                [["", row.series_title, row.number, row.title] for row in rows],
+                rows,
+            )
+            total_pages = max(1, self.poster_book_total_pages)
+            self.poster_book_page_label.setText(
+                f"{int(result.get('total') or 0)} tome(s) — page {self.poster_book_page + 1}/{total_pages}"
+            )
+            self.poster_book_prev.setEnabled(self.poster_book_page > 0)
+            self.poster_book_next.setEnabled(not bool(result.get("last", True)))
+            self._load_poster_target_thumbnails_async("book", self.poster_books_table, rows)
+
+        self.run_worker("Recherche tomes — couvertures", work, done)
+
+    def _set_poster_record(self, target_type: str, record: Any, *, refresh: bool = True) -> None:
+        if target_type not in {"series", "book"} or record is None:
+            return
+        target_id = str(getattr(record, "id", "") or "")
+        if not target_id:
+            return
+        previous_target = self.poster_id.text().strip()
+        if previous_target and previous_target != target_id and hasattr(self, "poster_search_table"):
+            self.poster_search_rows = []
+            self._set_table(
+                self.poster_search_table,
+                ["Aperçu", "Titre", "Résolution", "Source"],
+                [],
+                row_data=[],
+            )
+            self.poster_search_apply.setEnabled(False)
+            self.poster_search_selection_label.setText("Aucune couverture sélectionnée.")
+        self.poster_target_title = str(getattr(record, "title", "") or target_id)
+        if target_type == "series":
+            self.poster_selected_series = record
+            self.poster_target_tabs.setCurrentIndex(0)
+            self._set_context_selection(series=record)
+        else:
+            self.poster_selected_book = record
+            self.poster_target_tabs.setCurrentIndex(1)
+            parent = next(
+                (row for row in self.poster_series_rows if str(getattr(row, "id", "")) == str(getattr(record, "series_id", ""))),
+                None,
+            )
+            if parent is not None:
+                self._set_context_selection(series=parent)
+            self._set_context_selection(book=record)
+        self.poster_type.setCurrentText(target_type)
+        self.poster_id.setText(target_id)
+        self._set_metadata_target_type(target_type)
+        self.meta_target_id.setText(target_id)
+        self._update_poster_status()
+        if refresh:
+            self._refresh_poster_target(target_type, target_id)
+
+    def on_poster_series_target_selected(self) -> None:
+        record = self._selected_row_data(self.poster_series_table)
+        if record is not None:
+            self._set_poster_record("series", record)
+
+    def on_poster_book_target_selected(self) -> None:
+        record = self._selected_row_data(self.poster_books_table)
+        if record is not None:
+            self._set_poster_record("book", record)
+
+    def on_poster_target_tab_changed(self, index: int) -> None:
+        record = self.poster_selected_series if index == 0 else self.poster_selected_book
+        if record is not None:
+            self._set_poster_record("series" if index == 0 else "book", record, refresh=False)
+
     def _update_poster_status(self, *_: Any) -> None:
         if not hasattr(self, "poster_status_label"):
             return
         typ = self.poster_type.currentText().strip()
         tid = self.poster_id.text().strip()
         self.poster_status_label.setText(
-            f"Cible active : {typ} — {tid}" if typ and tid else "Aucune cible active. Utilisez une sélection ou renseignez un ID."
+            self.poster_target_title if typ and tid else "Aucune cible active. Sélectionnez une série ou un tome."
         )
+        if hasattr(self, "poster_technical_label"):
+            self.poster_technical_label.setText(f"{typ} — {tid}" if typ and tid else "Aucun ID")
+        is_book = bool(typ == "book" and tid and self.poster_selected_book is not None)
+        if hasattr(self, "poster_search_button"):
+            self.poster_search_button.setEnabled(is_book)
+            self.poster_search_apply.setEnabled(
+                is_book and self._selected_row_data(self.poster_search_table) is not None
+            )
+        if hasattr(self, "poster_search_query_label"):
+            if is_book:
+                book = self.poster_selected_book
+                series_title = str(getattr(book, "series_title", "") or self._active_context_series_title or "")
+                query = cover_search_query(series_title, getattr(book, "number", ""), getattr(book, "title", ""))
+                self.poster_search_query_label.setText(f"Recherche proposée : {query}")
+            else:
+                self.poster_search_query_label.setText("Disponible après sélection d'un tome.")
+
+    def on_poster_search_selection_changed(self) -> None:
+        candidate = self._selected_row_data(self.poster_search_table)
+        is_book = bool(
+            self.poster_type.currentText().strip() == "book"
+            and self.poster_id.text().strip()
+            and self.poster_selected_book is not None
+        )
+        selected = is_book and isinstance(candidate, dict)
+        self.poster_search_apply.setEnabled(selected)
+        if selected:
+            title = str(candidate.get("title") or "Image sans titre")
+            self.poster_search_selection_label.setText(f"Couverture sélectionnée : {title}")
+            self.poster_search_apply.setToolTip("Ajouter cette image à Komga et la définir comme couverture active.")
+        else:
+            self.poster_search_selection_label.setText("Aucune couverture sélectionnée.")
+            self.poster_search_apply.setToolTip("Sélectionnez une couverture dans les résultats.")
+
+    def select_poster_search_row(self, row: int, column: int = 0) -> None:
+        if row < 0 or row >= self.poster_search_table.rowCount():
+            return
+        target_column = column if 0 <= column < self.poster_search_table.columnCount() else 0
+        self.poster_search_table.setCurrentCell(row, target_column)
+        self.poster_search_table.selectRow(row)
+        self.on_poster_search_selection_changed()
+
+    def search_poster_covers(self) -> None:
+        book = self.poster_selected_book
+        if book is None or self.poster_type.currentText().strip() != "book":
+            QMessageBox.information(self, "Couvertures", "Sélectionnez d'abord un tome.")
+            return
+        series_title = str(getattr(book, "series_title", "") or self._active_context_series_title or "")
+        query = cover_search_query(series_title, getattr(book, "number", ""), getattr(book, "title", ""))
+
+        def work() -> tuple[List[Dict[str, Any]], Dict[str, bytes]]:
+            candidates = DuckDuckGoCoverSearchClient(timeout=min(45, int(self.timeout_seconds.value()))).search(query, limit=24)
+            rows = [candidate.public() for candidate in candidates]
+            thumbnails: Dict[str, bytes] = {}
+            for row in rows:
+                try:
+                    req = urlrequest.Request(
+                        str(row.get("thumbnail_url") or ""),
+                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://duckduckgo.com/"},
+                    )
+                    with urlrequest.urlopen(req, timeout=10) as response:
+                        thumbnails[str(row.get("id") or "")] = response.read(3 * 1024 * 1024 + 1)
+                except Exception:
+                    thumbnails[str(row.get("id") or "")] = b""
+            return rows, thumbnails
+
+        def done(payload: tuple[List[Dict[str, Any]], Dict[str, bytes]]) -> None:
+            rows, thumbnails = payload
+            self.poster_search_rows = rows
+            self._set_table(
+                self.poster_search_table,
+                ["Aperçu", "Titre", "Résolution", "Source"],
+                [[
+                    "",
+                    row.get("title", ""),
+                    f"{row.get('width') or '?'} × {row.get('height') or '?'}",
+                    row.get("source_url", ""),
+                ] for row in rows],
+                row_data=rows,
+            )
+            self.poster_search_table.setColumnWidth(0, 72)
+            for index, row in enumerate(rows):
+                label = QLabel("—")
+                label.setAlignment(Qt.AlignCenter)
+                label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                pixmap = QPixmap()
+                pixmap.loadFromData(thumbnails.get(str(row.get("id") or ""), b""))
+                if not pixmap.isNull():
+                    label.setText("")
+                    label.setPixmap(pixmap.scaled(52, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.poster_search_table.setCellWidget(index, 0, label)
+                self.poster_search_table.setRowHeight(index, 78)
+            if rows:
+                self.poster_search_table.setCurrentCell(0, 1)
+                self.poster_search_table.selectRow(0)
+            else:
+                self.on_poster_search_selection_changed()
+            self.poster_search_query_label.setText(
+                f"{len(rows)} résultat(s) — {query}" if rows else f"Aucun résultat — {query}"
+            )
+
+        self.run_worker("Recherche intégrée de couvertures", work, done)
+
+    def apply_searched_poster(self) -> None:
+        typ, target_id = self._poster_target()
+        candidate = self._selected_row_data(self.poster_search_table)
+        if typ != "book" or not target_id or not isinstance(candidate, dict):
+            QMessageBox.information(self, "Couvertures", "Sélectionnez un résultat de recherche pour ce tome.")
+            return
+        image_url = str(candidate.get("image_url") or "")
+        if not image_url:
+            QMessageBox.warning(self, "Couvertures", "Le résultat sélectionné ne contient pas d'image exploitable.")
+            return
+        if not self._confirm_searched_poster_write(image_url):
+            return
+
+        def work() -> str:
+            downloaded = download_cover_image(
+                image_url,
+                thumbnail_url=str(candidate.get("thumbnail_url") or ""),
+                source_url=str(candidate.get("source_url") or ""),
+                timeout=60,
+            )
+            temp_path = ""
+            api = self.komga_api()
+            before = api.list_thumbnails(typ, target_id)
+            before_ids = {str(row.get("id") or "") for row in before}
+            try:
+                suffix_by_type = {"image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+                suffix = os.path.splitext(urlparse(downloaded.final_url).path)[1] or suffix_by_type.get(downloaded.content_type, ".jpg")
+                fd, temp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+                with open(temp_path, "wb") as handle:
+                    handle.write(downloaded.data)
+                self.backup.save_json(
+                    "operation", typ, target_id,
+                    {
+                        "thumbnails": before,
+                        "poster_search_result": candidate,
+                        "downloaded_url": downloaded.final_url,
+                        "used_thumbnail_fallback": downloaded.used_fallback,
+                    },
+                    "avant ajout et sélection couverture recherchée",
+                )
+                response = api.add_thumbnail(typ, target_id, temp_path)
+                after = api.list_thumbnails(typ, target_id)
+                response_id = str(response.get("id") or response.get("thumbnailId") or "") if isinstance(response, dict) else ""
+                new_ids = [str(row.get("id") or "") for row in after if str(row.get("id") or "") not in before_ids]
+                thumbnail_id = response_id or (new_ids[-1] if new_ids else "")
+                if not thumbnail_id:
+                    raise RuntimeError("Image ajoutée, mais son identifiant Komga n'a pas pu être déterminé")
+                api.select_thumbnail(typ, target_id, thumbnail_id)
+                return thumbnail_id
+            finally:
+                if temp_path:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+        def done(thumbnail_id: str) -> None:
+            self.log(f"✅ Couverture recherchée ajoutée et sélectionnée : {thumbnail_id}")
+            self._refresh_poster_target(typ, target_id)
+
+        self.run_worker("Application couverture recherchée", work, done)
+
+    def _confirm_searched_poster_write(self, image_url: str) -> bool:
+        if self.simulation_enabled():
+            answer = QMessageBox.question(
+                self,
+                "Écriture réelle nécessaire",
+                "Le mode sécurisé (simulation) est actif.\n\n"
+                "Activer l'écriture réelle, créer une sauvegarde puis appliquer cette couverture ?\n\n"
+                f"{image_url}",
+            )
+            if answer != QMessageBox.Yes:
+                self.log("Application de la couverture annulée : mode simulation conservé.")
+                return False
+            self.context_mode_toggle.setChecked(False)
+            return True
+        return QMessageBox.question(
+            self,
+            "Ajouter et définir la couverture",
+            f"Télécharger cette image, l'ajouter au tome et la définir comme couverture active ?\n\n{image_url}",
+        ) == QMessageBox.Yes
 
     def _poster_target(self) -> tuple[str, str]:
         typ = self.poster_type.currentText().strip() if hasattr(self, "poster_type") else ""
         tid = self.poster_id.text().strip() if hasattr(self, "poster_id") else ""
-        if typ not in {"series", "book", "collection", "readlist"}:
+        if typ not in {"series", "book"}:
             QMessageBox.warning(self, "Couvertures", "Type de cible invalide.")
             return "", ""
         if not tid:
-            QMessageBox.warning(self, "Couvertures", "Aucun ID cible. Utilise une sélection ou colle un ID.")
+            QMessageBox.warning(self, "Couvertures", "Sélectionnez d'abord une série ou un tome dans la liste.")
             return "", ""
         return typ, tid
 
     def _refresh_poster_target(self, typ: str, tid: str) -> None:
         if typ and tid:
+            with self._poster_thumbnail_cache_lock:
+                self._poster_thumbnail_cache.pop((typ, tid), None)
             self._show_cover(typ, tid, self.poster_preview)
             self.list_posters()
 
     def use_selected_for_poster(self) -> None:
         bid = self._selected_id_from_table(self.books_table)
         sid = self._selected_id_from_table(self.series_table)
-        cid = self._selected_id_from_table(self.collections_table)
-        rid = self._selected_id_from_table(self.readlists_table)
         if bid:
-            self.poster_type.setCurrentText("book"); self.poster_id.setText(bid)
+            record = next((row for row in self.book_rows if str(getattr(row, "id", "")) == bid), None)
+            if record is not None:
+                self._set_poster_record("book", record)
         elif sid:
-            self.poster_type.setCurrentText("series"); self.poster_id.setText(sid)
-        elif cid:
-            self.poster_type.setCurrentText("collection"); self.poster_id.setText(cid)
-        elif rid:
-            self.poster_type.setCurrentText("readlist"); self.poster_id.setText(rid)
+            record = next((row for row in self.series_rows if str(getattr(row, "id", "")) == sid), None)
+            if record is not None:
+                self._set_poster_record("series", record)
         else:
-            QMessageBox.warning(self, "Couvertures", "Aucune série, tome, collection ou readlist sélectionnée.")
+            QMessageBox.warning(self, "Couvertures", "Aucune série ou aucun tome sélectionné dans l'Explorateur.")
             return
-        self._refresh_poster_target(self.poster_type.currentText(), self.poster_id.text().strip())
 
     def list_posters(self) -> None:
         typ, tid = self._poster_target()
@@ -14227,6 +18280,75 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # MangaBaka
     # ------------------------------------------------------------------
+    def _selected_mangabaka_automatch_series(self) -> List[Any]:
+        selection_model = self.mbk_komga_series_table.selectionModel()
+        if selection_model is None:
+            return []
+        indexes = sorted({index.row() for index in selection_model.selectedRows()})
+        return [self.mbk_komga_series_rows[index] for index in indexes if 0 <= index < len(self.mbk_komga_series_rows)]
+
+    def _refresh_mangabaka_automatch_button(self) -> None:
+        if not self.mbk_automatch_mode:
+            self.mbk_automatch_button.setText("Automatch multiple")
+            return
+        count = len(self._selected_mangabaka_automatch_series())
+        self.mbk_automatch_button.setText(f"Lancer l’automatch ({count})")
+        self.mbk_automatch_button.setEnabled(count > 0)
+
+    def enter_mangabaka_automatch_mode(self) -> None:
+        self.mbk_automatch_mode = True
+        self.mbk_komga_series_table.clearSelection()
+        self.mbk_komga_series_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.mbk_automatch_cancel_button.setVisible(True)
+        self._refresh_mangabaka_automatch_button()
+        QMessageBox.information(
+            self,
+            "Automatch MangaBaka — sélection multiple",
+            "Le mode Automatch est actif.\n\n"
+            "1. Sélectionnez uniquement les séries à analyser avec Ctrl ou Shift.\n"
+            "2. Le suffixe final (Chap) sera retiré uniquement pour la recherche et le score.\n"
+            "3. Recliquez sur « Lancer l’automatch » pour générer le tableau de résultats.\n"
+            "4. Vérifiez les correspondances présélectionnées, puis validez séparément les écritures.\n\n"
+            "La recherche automatique d’une série au simple clic est suspendue tant que ce mode reste actif.",
+        )
+
+    def leave_mangabaka_automatch_mode(self) -> None:
+        self.mbk_automatch_mode = False
+        self.mbk_komga_series_table.clearSelection()
+        self.mbk_komga_series_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.mbk_automatch_cancel_button.setVisible(False)
+        self.mbk_automatch_button.setEnabled(True)
+        self._refresh_mangabaka_automatch_button()
+
+    def toggle_mangabaka_automatch_mode(self) -> None:
+        if not self.mbk_automatch_mode:
+            self.enter_mangabaka_automatch_mode()
+            return
+        selected = self._selected_mangabaka_automatch_series()
+        if not selected:
+            QMessageBox.warning(self, "Automatch MangaBaka", "Sélectionnez au moins une série Komga.")
+            return
+        if not self.mangabaka_enabled.isChecked():
+            QMessageBox.warning(self, "Automatch MangaBaka", "Module MangaBaka désactivé dans l’onglet Connexion")
+            return
+        visible_limit = 24
+        selected_titles = [str(getattr(series, "title", "") or "") for series in selected]
+        title_lines = "\n".join(f"• {title}" for title in selected_titles[:visible_limit])
+        hidden_count = max(0, len(selected_titles) - visible_limit)
+        if hidden_count:
+            title_lines += f"\n… et {hidden_count} autre(s) série(s)."
+        answer = QMessageBox.question(
+            self,
+            "Confirmer la sélection MangaBaka",
+            f"{len(selected)} série(s) seront analysée(s) :\n\n{title_lines}\n\n"
+            "Cette liste correspond exactement aux lignes actuellement sélectionnées dans le tableau.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.run_mangabaka_automatch_preview(selected)
+
     def load_mangabaka_komga_series(self) -> None:
         lib_id = self._library_id("mangabaka")
         search = self.mbk_komga_search.text().strip()
@@ -14249,7 +18371,7 @@ class MainWindow(QMainWindow):
             suffix = f" — {', '.join(active_filters)}" if active_filters else ""
             self.log(f"✅ MangaBaka : {len(rows)} séries Komga chargées{suffix}")
 
-        self.run_worker("Chargement séries Komga pour MangaBaka", lambda: self.komga_api().series(lib_id, search=search, page_size=200), done)
+        self.run_worker("Chargement séries Komga pour MangaBaka", lambda: self._cached_series(lib_id, search=search), done)
 
     def _clear_mangabaka_views(self, message: str = "") -> None:
         self.mangabaka_results = []
@@ -14281,6 +18403,9 @@ class MainWindow(QMainWindow):
         return False
 
     def on_mangabaka_komga_series_selected(self) -> None:
+        if self.mbk_automatch_mode:
+            self._refresh_mangabaka_automatch_button()
+            return
         row = self._selected_row_index(self.mbk_komga_series_table)
         if row < 0 or row >= len(self.mbk_komga_series_rows):
             return
@@ -14288,7 +18413,7 @@ class MainWindow(QMainWindow):
         self._set_context_selection(series=series)
         self.mbk_context_generation += 1
         self.mbk_target_id.setText(series.id)
-        self.mbk_query.setText(clean_search_title(series.title))
+        self.mbk_query.setText(str(series.title or ""))
         self._clear_mangabaka_views(f"Série Komga sélectionnée : {series.title}\nRecherche MangaBaka en cours…")
         self.load_mangabaka_komga_books(series)
         self.search_mangabaka()
@@ -14320,7 +18445,7 @@ class MainWindow(QMainWindow):
         self.mbk_komga_books_table.setRowCount(0)
         self.run_worker(
             "Chargement tomes Komga pour MangaBaka",
-            lambda: self.komga_api().books(
+            lambda: self._cached_books(
                 lib_id,
                 getattr(series, "id", "") or None,
                 page_size=200,
@@ -14334,7 +18459,7 @@ class MainWindow(QMainWindow):
         row = self._selected_row_index(self.mbk_komga_series_table)
         if row >= 0 and row < len(self.mbk_komga_series_rows):
             self.mbk_target_id.setText(self.mbk_komga_series_rows[row].id)
-            self.mbk_query.setText(clean_search_title(self.mbk_komga_series_rows[row].title))
+            self.mbk_query.setText(mangabaka_search_title(self.mbk_komga_series_rows[row].title))
             return
         sid = self._selected_id_from_table(self.series_table)
         if sid:
@@ -14342,13 +18467,13 @@ class MainWindow(QMainWindow):
             if row >= 0 and row < len(self.series_rows):
                 series = self.series_rows[row]
                 self.mbk_target_id.setText(sid)
-                self.mbk_query.setText(clean_search_title(series.title))
+                self.mbk_query.setText(mangabaka_search_title(series.title))
 
     def search_mangabaka(self) -> None:
-        raw_query = self.mbk_query.text().strip()
+        raw_query = mangabaka_search_title(self.mbk_query.text())
+        if raw_query != self.mbk_query.text().strip():
+            self.mbk_query.setText(raw_query)
         query = clean_search_title(raw_query)
-        if query != raw_query:
-            self.mbk_query.setText(query)
         if not query:
             QMessageBox.warning(self, "MangaBaka", "Recherche vide")
             return
@@ -14389,7 +18514,7 @@ class MainWindow(QMainWindow):
         self.mbk_raw.setPlainText(f"Recherche MangaBaka en cours…\nRequête : {query}\nSi aucun résultat ne revient, le détail des essais sera affiché ici.")
         self._set_table(self.mbk_results_table, ["ID", "Titre", "Score match", "Type", "Status", "Année", "Publisher", "Genres", "URL"], [], stretch_from=1)
         self._reset_table_to_first_row(self.mbk_results_table)
-        self.run_worker("Recherche MangaBaka", lambda: self._search_mangabaka_with_fallback(query, manga_only), done)
+        self.run_worker("Recherche MangaBaka", lambda: self._search_mangabaka_with_fallback(raw_query, manga_only), done)
 
     def on_mangabaka_result_selected(self) -> None:
         row = self._selected_row_index(self.mbk_results_table)
@@ -14497,6 +18622,9 @@ class MainWindow(QMainWindow):
             return
         self.poster_type.setCurrentText("series")
         self.poster_id.setText(series_id)
+        self.poster_target_title = self._active_context_series_title or "Série sélectionnée"
+        self.poster_target_tabs.setCurrentIndex(0)
+        self._update_poster_status()
         self.poster_url.setText(self.mangabaka_candidate.cover_url)
         if hasattr(self, "poster_tab"):
             self._set_current_tab_for_widget(self.poster_tab)
@@ -14527,7 +18655,7 @@ class MainWindow(QMainWindow):
             suffix = f" — {', '.join(active_filters)}" if active_filters else ""
             self.log(f"✅ Manga News : {len(rows)} séries Komga chargées{suffix}")
 
-        self.run_worker("Chargement séries Komga pour Manga News", lambda: self.komga_api().series(lib_id, search=search, page_size=200), done)
+        self.run_worker("Chargement séries Komga pour Manga News", lambda: self._cached_series(lib_id, search=search), done)
 
     def _clear_manga_news_views(self, message: str = "") -> None:
         self.manga_news_results = []
@@ -14571,7 +18699,7 @@ class MainWindow(QMainWindow):
         self._set_context_selection(series=series)
         self.mn_context_generation += 1
         self.mn_target_id.setText(series.id)
-        self.mn_query.setText(clean_search_title(series.title))
+        self.mn_query.setText(str(series.title or ""))
         slug, url = self._manga_news_link_for_series(series)
         if slug or url:
             self._clear_manga_news_views(f"Série Komga sélectionnée : {series.title}\nLien Manga News existant détecté. Chargement direct…")
@@ -14586,7 +18714,7 @@ class MainWindow(QMainWindow):
         row = self._selected_row_index(self.mn_komga_series_table)
         if row >= 0 and row < len(self.mn_komga_series_rows):
             self.mn_target_id.setText(self.mn_komga_series_rows[row].id)
-            self.mn_query.setText(clean_search_title(self.mn_komga_series_rows[row].title))
+            self.mn_query.setText(str(self.mn_komga_series_rows[row].title or ""))
             return
         sid = self._selected_id_from_table(self.series_table)
         if sid:
@@ -14594,18 +18722,20 @@ class MainWindow(QMainWindow):
             if row >= 0 and row < len(self.series_rows):
                 series = self.series_rows[row]
                 self.mn_target_id.setText(sid)
-                self.mn_query.setText(clean_search_title(series.title))
+                self.mn_query.setText(str(series.title or ""))
 
     def search_manga_news(self) -> None:
         raw_query = self.mn_query.text().strip()
         query = clean_search_title(raw_query)
-        if query != raw_query:
-            self.mn_query.setText(query)
         if not query:
             QMessageBox.warning(self, "Manga News", "Recherche vide")
             return
         if not self.manga_news_enabled.isChecked():
             QMessageBox.warning(self, "Manga News", "Module Manga News désactivé dans l'onglet Connexion")
+            return
+        _, edition_hint = split_manga_news_edition_title(raw_query)
+        if edition_hint:
+            self._search_manga_news_editions(auto_load=True)
             return
         generation = self.mn_context_generation
         manga_only = self.mn_filter_manga_only.isChecked()
@@ -14654,7 +18784,71 @@ class MainWindow(QMainWindow):
         self.mn_raw.setPlainText(f"Recherche Manga News en cours…\nRequête : {query}\nFiltre manga uniquement : {'oui' if manga_only else 'non'}\nLes essais et erreurs seront affichés ici.")
         self._set_table(self.mn_results_table, ["Slug", "Titre", "Score match", "Score source", "Kind", "Media", "VF", "Volumes", "Titre VO", "URL"], [], stretch_from=1)
         self._reset_table_to_first_row(self.mn_results_table)
-        self.run_worker("Recherche Manga News", lambda: self._search_manga_news_with_fallback(query, manga_only), done)
+        self.run_worker("Recherche Manga News", lambda: self._search_manga_news_with_fallback(raw_query, manga_only), done)
+
+    def search_manga_news_editions(self) -> None:
+        self._search_manga_news_editions(auto_load=False)
+
+    def _search_manga_news_editions(self, *, auto_load: bool) -> None:
+        raw_query = self.mn_query.text().strip()
+        query = clean_search_title(raw_query)
+        if not query:
+            QMessageBox.warning(self, "Manga News", "Recherche vide")
+            return
+        if not self.manga_news_enabled.isChecked():
+            QMessageBox.warning(self, "Manga News", "Module Manga News désactivé dans l'onglet Connexion")
+            return
+        generation = self.mn_context_generation
+        self._record_enrichment_search("mn", self._current_manga_news_series_id())
+
+        def done(rows: List[MangaNewsSearchResult]) -> None:
+            if generation != self.mn_context_generation:
+                return
+            self.manga_news_results = rows
+            self._set_table(
+                self.mn_results_table,
+                ["Slug base", "Série / édition", "Édition", "Tomes listés", "Total final", "Statut", "Source statut", "Confiance", "Justification", "Slug tomes", "URL"],
+                [
+                    [
+                        row.slug,
+                        row.title,
+                        row.edition_display_name,
+                        row.edition_volume_count if row.edition_volume_count is not None else "",
+                        row.edition_total_volumes if row.edition_total_volumes is not None else "",
+                        row.edition_status,
+                        row.edition_status_source,
+                        row.edition_status_confidence,
+                        row.edition_status_reason,
+                        row.raw.get("series_slug", ""),
+                        row.url,
+                    ]
+                    for row in rows
+                ],
+                stretch_from=1,
+            )
+            preferred_row = next((index for index, row in enumerate(rows) if row.edition_preferred), 0)
+            if rows:
+                self.mn_results_table.selectRow(preferred_row)
+                self.mn_results_table.scrollToItem(self.mn_results_table.item(preferred_row, 0))
+                self.mn_raw.setPlainText(
+                    f"{len(rows)} édition(s) trouvée(s). "
+                    "Sélectionne une édition puis clique sur Charger résultat."
+                )
+                self.log(f"Manga News autres éditions : {query} → {len(rows)} résultat(s)")
+                if auto_load:
+                    self.fetch_selected_manga_news_series()
+            else:
+                self.mn_raw.setPlainText(f"Aucune autre édition Manga News trouvée pour : {query}")
+                self.log(f"Manga News autres éditions sans résultat : {query}")
+
+        self.mn_raw.setPlainText(f"Recherche des autres éditions Manga News en cours…\nRequête : {query}")
+        self._set_table(
+            self.mn_results_table,
+            ["Slug base", "Série / édition", "Édition", "Tomes listés", "Total final", "Statut", "Source statut", "Confiance", "Justification", "Slug tomes", "URL"],
+            [],
+            stretch_from=1,
+        )
+        self.run_worker("Recherche autres éditions Manga News", lambda: self.manga_news_client().search_editions(raw_query, limit=10), done)
 
     def on_manga_news_result_selected(self) -> None:
         row = self._selected_row_index(self.mn_results_table)
@@ -14674,6 +18868,14 @@ class MainWindow(QMainWindow):
             "title_vo": result.title_vo,
             "translated_title": result.translated_title,
             "source_url": result.url,
+            "edition_label": result.edition_label,
+            "edition_display_name": result.edition_display_name,
+            "edition_volume_count": result.edition_volume_count,
+            "edition_total_volumes": result.edition_total_volumes,
+            "edition_status": result.edition_status,
+            "edition_status_source": result.edition_status_source,
+            "edition_status_confidence": result.edition_status_confidence,
+            "edition_status_reason": result.edition_status_reason,
         }
         self._set_selection_detail("manga_news.result", result.title, data, result.url)
 
@@ -14702,11 +18904,30 @@ class MainWindow(QMainWindow):
             direct = slug or url
             self.log(f"✅ Série Manga News chargée directement : {candidate.title} — {direct}")
 
+        target_title = self.mn_query.text().strip()
+        _, edition_hint = split_manga_news_edition_title(target_title)
+        persisted_edition_label = manga_news_edition_label_from_url(url)
+
+        def load_candidate() -> MangaNewsCandidate:
+            client = self.manga_news_client()
+            if persisted_edition_label or edition_hint:
+                base_slug = slug or series_slug_from_manga_news_url(url)
+                if not base_slug:
+                    base = client.get_series_by_url(url)
+                    base_slug = base.slug or series_slug_from_manga_news_url(base.source_url)
+                if not base_slug:
+                    raise LookupError("Slug Manga News de la série de base introuvable")
+                if persisted_edition_label:
+                    return client.get_series_edition(
+                        base_slug,
+                        persisted_edition_label,
+                        target_title=target_title,
+                    )
+                return client.get_series_edition_by_hint(base_slug, edition_hint, target_title=target_title)
+            return client.get_series(slug) if slug else client.get_series_by_url(url)
+
         self.mn_raw.setPlainText(f"Chargement fiche Manga News en cours…\nCible : {slug or url}")
-        if slug:
-            self.run_worker("Chargement série Manga News direct", lambda: self.manga_news_client().get_series(slug), done)
-        else:
-            self.run_worker("Chargement série Manga News direct", lambda: self.manga_news_client().get_series_by_url(url), done)
+        self.run_worker("Chargement série Manga News direct", load_candidate, done)
 
     def fetch_selected_manga_news_series(self) -> None:
         row = self._selected_row_index(self.mn_results_table)
@@ -14725,7 +18946,20 @@ class MainWindow(QMainWindow):
             self.log(f"✅ Série Manga News chargée : {candidate.title} — {candidate.slug}")
 
         self.mn_raw.setPlainText(f"Chargement fiche Manga News en cours…\nSlug : {result.slug}\nTitre : {result.title}")
-        self.run_worker("Chargement série Manga News", lambda: self.manga_news_client().get_series(result.slug), done)
+        if result.edition_label:
+            target_title = self.mn_query.text().strip()
+            self.run_worker(
+                "Chargement édition Manga News",
+                lambda: self.manga_news_client().get_series_edition(
+                    result.slug,
+                    result.edition_label,
+                    target_title=target_title,
+                    edition_group=result.raw,
+                ),
+                done,
+            )
+        else:
+            self.run_worker("Chargement série Manga News", lambda: self.manga_news_client().get_series(result.slug), done)
 
     def _current_manga_news_series_id(self) -> str:
         explicit_id = self.mn_target_id.text().strip()
@@ -14764,7 +18998,7 @@ class MainWindow(QMainWindow):
         self.mn_komga_books_table.setRowCount(0)
         self.run_worker(
             "Chargement tomes Komga pour Manga News",
-            lambda: self.komga_api().books(
+            lambda: self._cached_books(
                 lib_id,
                 getattr(series, "id", "") or None,
                 page_size=200,
@@ -14842,6 +19076,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Manga News", "Numéro du tome Komga introuvable")
             return
         generation = self.mn_context_generation
+        edition_label = ""
+        if self.manga_news_candidate and isinstance(self.manga_news_candidate.raw, dict):
+            edition_label = str(self.manga_news_candidate.raw.get("edition_label") or "").strip()
+        if not edition_label:
+            edition_label = manga_news_edition_label_from_url(url)
 
         def done(candidate: MangaNewsVolumeCandidate) -> None:
             if generation != self.mn_context_generation:
@@ -14853,7 +19092,11 @@ class MainWindow(QMainWindow):
             self.log(f"✅ Volume Manga News chargé par numéro : {candidate.title} — {candidate.number or number}")
 
         self.mn_book_preview.setPlainText(f"Chargement volume Manga News par numéro…\nSlug : {slug}\nNuméro : {number}")
-        self.run_worker("Chargement volume Manga News par numéro", lambda: self.manga_news_client().get_volume_by_number(slug, number), done)
+        self.run_worker(
+            "Chargement volume Manga News par numéro",
+            lambda: self.manga_news_client().get_volume_by_number(slug, number, edition_label=edition_label),
+            done,
+        )
 
     def load_manga_news_volume_by_url(self) -> None:
         url = self.mn_volume_url.text().strip()
@@ -14940,7 +19183,37 @@ class MainWindow(QMainWindow):
         ONGOING -> ENDED. Other advanced fields stay conservative when Komga
         already has a value.
         """
-        self._fill_series_preview_metadata_table(self.mn_series_metadata_table, current, candidate)
+        candidate_for_table = dict(candidate or {})
+        candidate_links = metadata_link_entries(candidate_for_table.get("links"))
+        edition_link_selected = any(
+            manga_news_edition_label_from_url(row.get("url")) for row in candidate_links
+        )
+        desired_links: Optional[List[Dict[str, str]]] = None
+        if edition_link_selected:
+            desired_links = merge_manga_news_edition_links((current or {}).get("links"), candidate_links)
+            # The generic list rule appends links. An edition choice must replace
+            # the previous Manga News link while preserving every other provider.
+            candidate_for_table.pop("links", None)
+        self._fill_series_preview_metadata_table(self.mn_series_metadata_table, current, candidate_for_table)
+        if desired_links is not None:
+            current_links = metadata_link_entries((current or {}).get("links"))
+            for row in range(self.mn_series_metadata_table.rowCount()):
+                field_item = self.mn_series_metadata_table.item(row, 0)
+                if field_item is None or self._metadata_field_key(field_item) != "links":
+                    continue
+                current_item = self.mn_series_metadata_table.item(row, 1)
+                new_item = self.mn_series_metadata_table.item(row, 2)
+                include_item = self.mn_series_metadata_table.item(row, 3)
+                if current_item is not None:
+                    current_item.setText(one_line(current_links))
+                if new_item is not None:
+                    new_item.setText(one_line(desired_links))
+                    new_item.setToolTip(one_line(desired_links))
+                if include_item is not None:
+                    include_item.setCheckState(
+                        Qt.Checked if one_line(current_links) != one_line(desired_links) else Qt.Unchecked
+                    )
+                break
         conservative_when_present = {"publisher", "ageRating", "alternateTitles", "authors"}
         for row in range(self.mn_series_metadata_table.rowCount()):
             field_item = self.mn_series_metadata_table.item(row, 0)
@@ -14988,9 +19261,16 @@ class MainWindow(QMainWindow):
                     new_item.setToolTip(f"{tooltip}\n\n{new_item.text()}")
 
     def _manga_news_payload_from_metadata_maps(self, current: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
+        candidate_for_payload = dict(candidate or {})
+        candidate_links = metadata_link_entries(candidate_for_payload.get("links"))
+        edition_link_selected = any(
+            manga_news_edition_label_from_url(row.get("url")) for row in candidate_links
+        )
+        if edition_link_selected:
+            candidate_for_payload.pop("links", None)
         payload = self._payload_from_metadata_maps(
             current,
-            candidate,
+            candidate_for_payload,
             SERIES_METADATA_FIELDS,
             target_type="series",
             critical_changes=True,
@@ -15018,6 +19298,11 @@ class MainWindow(QMainWindow):
                 proposed_count = 0
             if current_count > 0 and proposed_count > 0 and proposed_count < current_count:
                 payload.pop("totalBookCount", None)
+        if edition_link_selected:
+            current_links = metadata_link_entries((current or {}).get("links"))
+            desired_links = merge_manga_news_edition_links(current_links, candidate_links)
+            if one_line(current_links) != one_line(desired_links):
+                payload["links"] = desired_links
         return payload
 
     def preview_manga_news_series(self) -> None:
@@ -15121,9 +19406,45 @@ class MainWindow(QMainWindow):
         return str(combo.currentData() or "manga_news") if combo is not None else "manga_news"
 
     def _next_release_source_label(self) -> str:
-        return "MangaBaka" if self._next_release_source() == "mangabaka" else "Manga News"
+        labels = {
+            "manga_news": "Manga News",
+            "mangabaka": "MangaBaka",
+            "mangacollec": "MangaCollec",
+        }
+        return labels.get(self._next_release_source(), "Manga News")
+
+    def _next_release_source_changed(self) -> None:
+        local_catalog = self._next_release_source() == "mangacollec"
+        if hasattr(self, "nr_mangacollec_box"):
+            self.nr_mangacollec_box.setVisible(local_catalog)
+        self.nr_require_source_link.setEnabled(not local_catalog)
+        if local_catalog:
+            self.nr_require_source_link.setChecked(False)
+            self.nr_require_source_link.setText("Utiliser le matching MangaCollec")
+        else:
+            self.nr_require_source_link.setText("Exiger un lien source")
+        self._apply_next_release_series_filters()
+
+    def _refresh_next_release_mangacollec_status(self) -> None:
+        if not hasattr(self, "nr_mangacollec_catalog_status"):
+            return
+        status = self.mangacollec_store.status()
+        if not status.get("configured"):
+            self.nr_mangacollec_catalog_status.setText(
+                "Aucun catalogue chargé. Importez le CSV ou JSON avant le scan."
+            )
+            return
+        self.nr_mangacollec_catalog_status.setText(
+            f"Catalogue actif : {status.get('filename') or 'fichier importé'} · "
+            f"{status.get('release_count', 0)} sortie(s) · "
+            f"{status.get('series_count', 0)} série(s) · "
+            f"{status.get('date_min', '—')} → {status.get('date_max', '—')}. "
+            "Le tableau ci-dessous affichera la valeur actuelle Komga et la valeur proposée."
+        )
 
     def _next_release_link_for_series(self, series: Any) -> tuple[str, str]:
+        if self._next_release_source() == "mangacollec":
+            return "", ""
         if self._next_release_source() == "mangabaka":
             return self._mangabaka_link_for_series(series)
         return self._manga_news_link_for_series(series)
@@ -15199,7 +19520,7 @@ class MainWindow(QMainWindow):
                 f"{counts.get('visible', 0)} affichée(s) après filtres locaux"
             )
 
-        self.run_worker("Chargement séries prochaines sorties", lambda: self.komga_api().series(lib_id, search=search, page_size=200), done)
+        self.run_worker("Chargement séries prochaines sorties", lambda: self._cached_series(lib_id, search=search), done)
 
     def _selected_next_release_series(self) -> List[Any]:
         rows: List[Any] = []
@@ -15250,8 +19571,16 @@ class MainWindow(QMainWindow):
         source_label = self._next_release_source_label()
 
         def do_scan() -> List[Dict[str, Any]]:
+            api = self.komga_api()
             mn_client = self.manga_news_client() if source == "manga_news" else None
             mbk_client = self.mangabaka_client() if source == "mangabaka" else None
+            mangacollec_matches = (
+                self.mangacollec_store.next_releases_by_series(
+                    self.nr_series_unfiltered_rows or series_rows
+                )
+                if source == "mangacollec"
+                else {}
+            )
             rows: List[Dict[str, Any]] = []
             total = len(series_rows)
             for index, series in enumerate(series_rows, start=1):
@@ -15276,11 +19605,65 @@ class MainWindow(QMainWindow):
                     "error": "",
                     "raw": {},
                 }
-                if not source_id and not url:
+                if source != "mangacollec" and not source_id and not url:
                     row["action"] = f"Ignoré : aucun lien {source_label}"
                     rows.append(row)
                     continue
                 try:
+                    if source == "mangacollec":
+                        match = mangacollec_matches.get(str(getattr(series, "id", "") or ""))
+                        if not match:
+                            row["action"] = "Ignoré : aucune correspondance sûre"
+                            rows.append(row)
+                            continue
+                        release = match["release"]
+                        match_status = str(match.get("match_status") or "")
+                        source_key = str(match.get("source_key") or "")
+                        row["source_id"] = source_key
+                        row["source_title"] = release.series
+                        row["match_status"] = match_status
+                        row["match_score"] = match.get("score", 0.0)
+                        row["volume"] = release.volume
+                        row["date"] = release.release_date
+                        try:
+                            release_day = datetime.strptime(release.release_date, "%Y-%m-%d").date()
+                        except ValueError:
+                            release_day = None
+                        if release_day is None or release_day < datetime.now().date():
+                            row["action"] = "Ignoré : date passée ou invalide"
+                            rows.append(row)
+                            continue
+                        yyyy, mm, dd = release.release_date.split("-", 2)
+                        row["new_tag"] = f"{NEXT_RELEASE_TAG_PREFIX}{re.sub(r'\s+', '', release.volume)}-{dd}.{mm}.{yyyy}"
+                        row["raw"] = {
+                            "series": release.series,
+                            "volume": release.volume,
+                            "release_date": release.release_date,
+                            "match_status": match_status,
+                        }
+                        wanted_number = normalize_volume_number(release.volume)
+                        books = api.books(series_id=str(getattr(series, "id", "") or ""), page_size=500)
+                        existing = next(
+                            (
+                                book for book in books
+                                if wanted_number
+                                and normalize_volume_number(
+                                    getattr(book, "number", "")
+                                    or (getattr(book, "metadata", {}) or {}).get("number", "")
+                                    or (getattr(book, "metadata", {}) or {}).get("numberSort", "")
+                                ) == wanted_number
+                            ),
+                            None,
+                        )
+                        row["volume_in_komga"] = existing is not None
+                        row["existing_book_id"] = str(getattr(existing, "id", "") or "") if existing is not None else ""
+                        if existing is not None:
+                            row["action"] = "Ignoré : tome déjà présent dans Komga"
+                            rows.append(row)
+                            continue
+                        row["action"] = "Déjà à jour" if row["new_tag"] == row["old_tag"] else "À appliquer"
+                        rows.append(row)
+                        continue
                     if source == "mangabaka":
                         if not source_id:
                             raise ValueError("ID série MangaBaka introuvable dans le lien")
@@ -15301,6 +19684,23 @@ class MainWindow(QMainWindow):
                         row["source_url"] = candidate.source_url or url
                         row["volume"] = candidate.number
                         row["date"] = candidate.release_date
+                    if candidate.release_date:
+                        try:
+                            release_day = datetime.strptime(candidate.release_date, "%Y-%m-%d").date()
+                        except ValueError:
+                            release_day = None
+                        if release_day is None or release_day < datetime.now().date():
+                            row["action"] = "Ignoré : date passée ou invalide"
+                            rows.append(row)
+                            continue
+                    if source == "manga_news" and candidate.release_date and not candidate.number:
+                        row["action"] = "À vérifier : date seule, aucun numéro explicite"
+                        row["error"] = (
+                            "Manga News indique une date de prochaine sortie sans annoncer de numéro de tome. "
+                            "Aucun tag nextrelease n'est proposé."
+                        )
+                        rows.append(row)
+                        continue
                     tag = self._next_release_tag(candidate)
                     row["new_tag"] = tag
                     if not tag:
@@ -15308,9 +19708,31 @@ class MainWindow(QMainWindow):
                         row["error"] = self._next_release_empty_reason(candidate.raw)
                         if source == "mangabaka" and not row["error"]:
                             row["error"] = "MangaBaka ne fournit pas de date/volume de prochaine sortie exploitable pour cette fiche."
-                    elif tag == row["old_tag"]:
-                        row["action"] = "Déjà à jour"
                     else:
+                        wanted_number = normalize_volume_number(candidate.number)
+                        books = api.books(series_id=str(getattr(series, "id", "") or ""), page_size=500)
+                        existing = next(
+                            (
+                                book for book in books
+                                if wanted_number
+                                and normalize_volume_number(
+                                    getattr(book, "number", "")
+                                    or (getattr(book, "metadata", {}) or {}).get("number", "")
+                                    or (getattr(book, "metadata", {}) or {}).get("numberSort", "")
+                                ) == wanted_number
+                            ),
+                            None,
+                        )
+                        row["volume_in_komga"] = existing is not None
+                        row["existing_book_id"] = str(getattr(existing, "id", "") or "") if existing is not None else ""
+                        if existing is not None:
+                            row["action"] = "Ignoré : tome déjà présent dans Komga"
+                            rows.append(row)
+                            continue
+                        if tag == row["old_tag"]:
+                            row["action"] = "Déjà à jour"
+                            rows.append(row)
+                            continue
                         fallback = raw_data.get("fallback") if isinstance(raw_data, dict) else None
                         row["action"] = "À appliquer (date série)" if fallback else "À appliquer"
                 except Exception as exc:
@@ -15332,6 +19754,9 @@ class MainWindow(QMainWindow):
     def _next_release_row_has_pending_change(row: Dict[str, Any]) -> bool:
         new_tag = str((row or {}).get("new_tag") or "").strip()
         old_tag = str((row or {}).get("old_tag") or "").strip()
+        action = str((row or {}).get("action") or "").strip()
+        if action.startswith(("Ignoré", "Aucune", "Erreur")):
+            return False
         return bool(new_tag) and new_tag != old_tag
 
     def _visible_next_release_rows(self) -> List[Dict[str, Any]]:
@@ -15344,17 +19769,19 @@ class MainWindow(QMainWindow):
         self.nr_visible_rows = self._visible_next_release_rows()
         self._set_table(
             self.nr_results_table,
-            ["Series ID", "Titre", "Source", "Source ID", "Status", "Ancien tag", "Nouveau tag", "Tome", "Date", "Action", "URL", "Erreur"],
+            ["Series ID", "Titre", "Source", "Source ID", "Matching", "Status", "Valeur actuelle Komga", "Valeur proposée", "Tome", "Déjà présent", "Date", "Action", "URL", "Erreur"],
             [
                 [
                     row.get("series_id", ""),
                     row.get("title", ""),
                     row.get("source", ""),
                     row.get("source_id", "") or row.get("slug", ""),
+                    row.get("match_status", ""),
                     row.get("status", ""),
                     row.get("old_tag", ""),
                     row.get("new_tag", ""),
                     row.get("volume", ""),
+                    "Oui" if row.get("volume_in_komga") else "Non",
                     row.get("date", ""),
                     row.get("action", ""),
                     row.get("source_url", ""),
@@ -15366,6 +19793,16 @@ class MainWindow(QMainWindow):
             selection_mode=QAbstractItemView.ExtendedSelection,
             row_data=self.nr_visible_rows,
         )
+        if self._next_release_source() == "mangacollec":
+            selection = self.nr_results_table.selectionModel()
+            if selection is not None:
+                selection.clearSelection()
+                for index, row in enumerate(self.nr_visible_rows):
+                    if self._next_release_row_has_pending_change(row) and row.get("action") == "À appliquer":
+                        selection.select(
+                            self.nr_results_table.model().index(index, 0),
+                            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                        )
         self._update_next_release_scope_labels()
 
     def on_next_release_result_selected(self) -> None:
@@ -15438,7 +19875,10 @@ class MainWindow(QMainWindow):
                         report["apply_status"] = "OK simulation"
                     else:
                         row_source = str(row.get("source") or self._next_release_source())
-                        row_source_label = "MangaBaka" if row_source == "mangabaka" else "Manga News"
+                        row_source_label = {
+                            "mangabaka": "MangaBaka",
+                            "mangacollec": "MangaCollec",
+                        }.get(row_source, "Manga News")
                         self.backup.save_json(
                             "operation",
                             "series",
@@ -15499,7 +19939,7 @@ class MainWindow(QMainWindow):
             suffix = f" — {', '.join(active_filters)}" if active_filters else ""
             self.log(f"✅ ComicVine : {len(rows)} séries Komga chargées{suffix}")
 
-        self.run_worker("Chargement séries Komga pour ComicVine", lambda: self.komga_api().series(lib_id, search=search, page_size=200), done)
+        self.run_worker("Chargement séries Komga pour ComicVine", lambda: self._cached_series(lib_id, search=search), done)
 
     def _clear_comicvine_views(self, message: str = "") -> None:
         self.comicvine_results = []
@@ -15551,7 +19991,7 @@ class MainWindow(QMainWindow):
         self._set_context_selection(series=series)
         self.cv_context_generation += 1
         self.cv_target_id.setText(series.id)
-        self.cv_query.setText(clean_search_title(series.title))
+        self.cv_query.setText(str(series.title or ""))
         volume_id, url = self._comicvine_link_for_series(series)
         if volume_id:
             self._clear_comicvine_views(f"Série Komga sélectionnée : {series.title}\nLien ComicVine existant détecté. Chargement direct…")
@@ -15566,7 +20006,7 @@ class MainWindow(QMainWindow):
         row = self._selected_row_index(self.cv_komga_series_table)
         if row >= 0 and row < len(self.cv_komga_series_rows):
             self.cv_target_id.setText(self.cv_komga_series_rows[row].id)
-            self.cv_query.setText(clean_search_title(self.cv_komga_series_rows[row].title))
+            self.cv_query.setText(str(self.cv_komga_series_rows[row].title or ""))
             return
         sid = self._selected_id_from_table(self.series_table)
         if sid:
@@ -15574,13 +20014,11 @@ class MainWindow(QMainWindow):
             if row >= 0 and row < len(self.series_rows):
                 series = self.series_rows[row]
                 self.cv_target_id.setText(sid)
-                self.cv_query.setText(clean_search_title(series.title))
+                self.cv_query.setText(str(series.title or ""))
 
     def search_comicvine(self) -> None:
         raw_query = self.cv_query.text().strip()
         query = clean_search_title(raw_query)
-        if query != raw_query:
-            self.cv_query.setText(query)
         if not query:
             QMessageBox.warning(self, "ComicVine", "Recherche vide")
             return
@@ -15624,7 +20062,7 @@ class MainWindow(QMainWindow):
         self.cv_raw.setPlainText(f"Recherche ComicVine en cours…\nRequête : {query}\nLes essais et erreurs seront affichés ici.")
         self._set_table(self.cv_results_table, ["ID", "Titre", "Score match", "Année", "Publisher", "Issues", "Résumé", "URL"], [], stretch_from=1)
         self._reset_table_to_first_row(self.cv_results_table)
-        self.run_worker("Recherche ComicVine", lambda: self._search_comicvine_with_fallback(query), done)
+        self.run_worker("Recherche ComicVine", lambda: self._search_comicvine_with_fallback(raw_query), done)
 
     def on_comicvine_result_selected(self) -> None:
         row = self._selected_row_index(self.cv_results_table)
@@ -15742,7 +20180,7 @@ class MainWindow(QMainWindow):
             self.cv_komga_books_table.setRowCount(0)
         self.run_worker(
             "Chargement tomes Komga pour ComicVine",
-            lambda: self.komga_api().books(
+            lambda: self._cached_books(
                 lib_id,
                 getattr(series, "id", "") or None,
                 page_size=200,
@@ -16098,10 +20536,237 @@ class MainWindow(QMainWindow):
             return
         self.poster_type.setCurrentText("series")
         self.poster_id.setText(series_id)
+        self.poster_target_title = self._active_context_series_title or "Série sélectionnée"
+        self.poster_target_tabs.setCurrentIndex(0)
+        self._update_poster_status()
         self.poster_url.setText(self.comicvine_candidate.cover_url)
         if hasattr(self, "poster_tab"):
             self._set_current_tab_for_widget(self.poster_tab)
         self.log("ComicVine : cover copiée dans l'onglet Couvertures. Elle ne sera uploadée que si tu cliques le bouton URL, simulation désactivée.")
+
+
+    # ------------------------------------------------------------------
+    # Metron — première étape mono-série
+    # ------------------------------------------------------------------
+    def load_metron_komga_series(self) -> None:
+        lib_id = self._library_id("metron")
+        search = self.metron_komga_search.text().strip()
+        generation = self._next_series_load_generation("metron")
+
+        def done(rows: List[Any]) -> None:
+            if not self._is_current_series_load_generation("metron", generation):
+                return
+            rows = self._filter_global_series_visibility(rows)
+            self._source_series_unfiltered_rows["metron"] = rows
+            self._refresh_source_link_filter_options("metron", rows)
+            rows, active_filters = self._apply_source_series_filters("metron", rows)
+            self.metron_komga_series_rows = rows
+            self._set_table(
+                self.metron_komga_series_table,
+                self._series_table_headers(include_history=True),
+                self._series_table_rows_for_source("metron", rows),
+                stretch_from=1,
+            )
+            suffix = f" — {', '.join(active_filters)}" if active_filters else ""
+            self.log(f"✅ Metron : {len(rows)} séries Komga chargées{suffix}")
+
+        self.run_worker("Chargement séries Komga pour Metron", lambda: self._cached_series(lib_id, search=search), done)
+
+    def _clear_metron_views(self, message: str = "") -> None:
+        self.metron_results = []
+        self.metron_candidate = None
+        self.metron_results_table.setRowCount(0)
+        self._fill_series_preview_metadata_table(self.metron_series_metadata_table, {}, {})
+        self.metron_series_preview.setPlainText(message or "Sélectionne une série Komga puis un résultat Metron.")
+        self.metron_raw.setPlainText(message or "")
+        self._set_selection_detail("metron.result", "", {"info": message or "Aucun résultat Metron sélectionné."}, "")
+
+    def on_metron_komga_series_selected(self) -> None:
+        row = self._selected_row_index(self.metron_komga_series_table)
+        if row < 0 or row >= len(self.metron_komga_series_rows):
+            return
+        series = self.metron_komga_series_rows[row]
+        self._set_context_selection(series=series)
+        self.metron_context_generation += 1
+        self.metron_target_id.setText(series.id)
+        self.metron_query.setText(str(series.title or ""))
+        self._clear_metron_views(f"Série Komga sélectionnée : {series.title}\nRecherche Metron en cours…")
+        self.search_metron()
+
+    def use_selected_for_metron(self) -> None:
+        row = self._selected_row_index(self.metron_komga_series_table)
+        if 0 <= row < len(self.metron_komga_series_rows):
+            series = self.metron_komga_series_rows[row]
+            self.metron_target_id.setText(series.id)
+            self.metron_query.setText(str(series.title or ""))
+            return
+        row = self._selected_row_index(self.series_table)
+        if 0 <= row < len(self.series_rows):
+            series = self.series_rows[row]
+            self.metron_target_id.setText(series.id)
+            self.metron_query.setText(str(series.title or ""))
+
+    def _current_metron_series_id(self) -> str:
+        explicit_id = self.metron_target_id.text().strip()
+        if explicit_id:
+            return explicit_id
+        row = self._selected_row_index(self.metron_komga_series_table)
+        if 0 <= row < len(self.metron_komga_series_rows):
+            return self.metron_komga_series_rows[row].id
+        return ""
+
+    def search_metron(self) -> None:
+        raw_query = self.metron_query.text().strip()
+        query = clean_search_title(raw_query)
+        if not query:
+            QMessageBox.warning(self, "Metron", "Recherche vide")
+            return
+        if not self.metron_enabled.isChecked():
+            QMessageBox.warning(self, "Metron", "Module Metron désactivé dans l’onglet Connexion")
+            return
+        if not self.metron_token.text().strip():
+            QMessageBox.warning(self, "Metron", "Jeton API Metron absent")
+            return
+        generation = self.metron_context_generation
+        self._record_enrichment_search("metron", self._current_metron_series_id())
+        self.metron_raw.setPlainText(f"Recherche Metron en cours…\nRequête : {query}")
+
+        def done(search_result: Dict[str, Any]) -> None:
+            if generation != self.metron_context_generation:
+                return
+            rows = search_result.get("rows") or []
+            ranked = ranked_title_results(query, rows)
+            self.metron_results = [item for _score, item in ranked]
+            self._set_table(
+                self.metron_results_table,
+                ["ID", "Titre", "Score match", "Début", "Fin", "Volume", "Issues", "URL"],
+                [
+                    [
+                        result.id,
+                        result.title,
+                        f"{score:.3f}",
+                        result.year_began,
+                        result.year_end,
+                        result.volume,
+                        result.issue_count if result.issue_count is not None else "",
+                        result.source_url,
+                    ]
+                    for score, result in ranked
+                ],
+                stretch_from=1,
+            )
+            if not self.metron_results:
+                self.metron_raw.setPlainText(
+                    f"Aucun résultat Metron. Essais : {self._format_search_attempts(search_result.get('attempts') or [])}"
+                )
+                self._set_selection_detail("metron.result", "", {"info": "Aucun résultat Metron."}, "")
+                return
+            self._reset_table_to_first_row(self.metron_results_table)
+            self.metron_raw.setPlainText(
+                f"{len(self.metron_results)} résultat(s), triés par score. "
+                "Le meilleur résultat est sélectionné et chargé automatiquement.\n"
+                f"Essais : {self._format_search_attempts(search_result.get('attempts') or [])}"
+            )
+            self.fetch_selected_metron_series()
+
+        self.run_worker("Recherche Metron", lambda: self._search_metron_with_fallback(raw_query), done)
+
+    def on_metron_result_selected(self) -> None:
+        row = self._selected_row_index(self.metron_results_table)
+        if row < 0 or row >= len(self.metron_results):
+            self._set_selection_detail("metron.result", "", {"info": "Aucun résultat Metron sélectionné."}, "")
+            return
+        result = self.metron_results[row]
+        data = {
+            "source": "metron",
+            "id": result.id,
+            "title": result.title,
+            "year_began": result.year_began,
+            "year_end": result.year_end,
+            "volume": result.volume,
+            "issue_count": result.issue_count,
+            "source_url": result.source_url,
+        }
+        self._set_selection_detail("metron.result", result.title, data, result.source_url)
+
+    def fetch_selected_metron_series(self) -> None:
+        row = self._selected_row_index(self.metron_results_table)
+        if row < 0 or row >= len(self.metron_results):
+            QMessageBox.warning(self, "Metron", "Aucun résultat Metron sélectionné")
+            return
+        result = self.metron_results[row]
+        generation = self.metron_context_generation
+
+        def done(candidate: MetronCandidate) -> None:
+            if generation != self.metron_context_generation:
+                return
+            self.metron_candidate = candidate
+            self.metron_raw.setPlainText(json_text(MetronClient.candidate_to_dict(candidate)))
+            self.preview_metron_series()
+            self.log(f"✅ Série Metron chargée : {candidate.title} — {candidate.series_id}")
+
+        self.run_worker("Chargement série Metron", lambda: self.metron_client().get_series(result.id), done)
+
+    def preview_metron_series(self) -> None:
+        if not self.metron_candidate:
+            self.metron_series_preview.setPlainText("Aucune série Metron chargée.")
+            return
+        series_id = self._current_metron_series_id()
+        if not series_id:
+            self.metron_series_preview.setPlainText("Aucune série Komga sélectionnée.")
+            return
+        proposed = self.metron_candidate.series_metadata
+
+        def done(current: Dict[str, Any]) -> None:
+            self._fill_series_preview_metadata_table(self.metron_series_metadata_table, current, proposed)
+            payload = self._payload_from_metadata_table(self.metron_series_metadata_table)
+            endpoint = f"PATCH /api/v1/series/{series_id}/metadata"
+            self.metron_series_preview.setPlainText(self._format_diff(current, payload, endpoint))
+
+        self.run_worker("Prévisualisation Metron série", lambda: self._fetch_current_series_preview_metadata(series_id), done)
+
+    def apply_metron_series(self) -> None:
+        series_id = self._current_metron_series_id()
+        payload = self._payload_from_metadata_table(self.metron_series_metadata_table)
+        if not series_id or not payload:
+            QMessageBox.warning(self, "Metron", "Série Komga ou payload vide")
+            return
+        if self.simulation_enabled():
+            self.preview_metron_series()
+            self.log("Simulation active : aucune écriture série Metron")
+            return
+        if not self._confirm_source_write(
+            source_name="Metron",
+            target_label=f"série {series_id}",
+            field_count=len(payload),
+        ):
+            return
+
+        def do_apply() -> Any:
+            api = self.komga_api()
+            current = self._fetch_current_metadata("series", series_id)
+            self.backup.save_json(
+                "operation",
+                "series",
+                series_id,
+                {
+                    "current": current,
+                    "metron": MetronClient.candidate_to_dict(self.metron_candidate) if self.metron_candidate else {},
+                    "payload": payload,
+                },
+                "avant PATCH Metron série",
+            )
+            return self._write_metadata_update(
+                api,
+                "series",
+                series_id,
+                payload,
+                current,
+                source="metron_manual",
+                note="Application Metron série",
+            )
+
+        self.run_worker("Application Metron série", do_apply, lambda _result: self.log(f"✅ Metadata Metron appliquée sur série:{series_id}"))
 
 
     # ------------------------------------------------------------------
@@ -16128,7 +20793,7 @@ class MainWindow(QMainWindow):
             )
             suffix = f" — {', '.join(active_filters)}" if active_filters else ""
             self.log(f"✅ Bedetheque : {len(rows)} séries Komga chargées{suffix}")
-        self.run_worker("Chargement séries Komga pour Bedetheque", lambda: self.komga_api().series(lib_id, search=search, page_size=200), done)
+        self.run_worker("Chargement séries Komga pour Bedetheque", lambda: self._cached_series(lib_id, search=search), done)
 
     def add_selected_bedetheque_series_to_queue(self) -> None:
         rows = self._selected_row_indexes(self.bdt_komga_series_table)
@@ -16252,7 +20917,7 @@ class MainWindow(QMainWindow):
         generation = self.bdt_context_generation
         self.bdt_target_type.setCurrentText("series")
         self.bdt_target_id.setText(series.id)
-        self.bdt_query.setText(clean_search_title(series.title))
+        self.bdt_query.setText(str(series.title or ""))
         self._select_bedetheque_komga_series_row_by_id(series.id)
         self._clear_bedetheque_comparison_views(
             f"File Bedetheque : série {self.bdt_queue_index + 1}/{len(self.bdt_queue)} — {series.title}\n"
@@ -16273,7 +20938,7 @@ class MainWindow(QMainWindow):
             )
             self.search_bedetheque()
 
-        self.run_worker("File Bedetheque : chargement tomes Komga", lambda: self.komga_api().books(lib_id, series.id), done_books)
+        self.run_worker("File Bedetheque : chargement tomes Komga", lambda: self._cached_books(lib_id, series.id), done_books)
 
     def next_bedetheque_queue_item(self) -> None:
         if not self.bdt_queue:
@@ -16305,7 +20970,7 @@ class MainWindow(QMainWindow):
         generation = self.bdt_context_generation
         self.bdt_target_type.setCurrentText("series")
         self.bdt_target_id.setText(series.id)
-        self.bdt_query.setText(clean_search_title(series.title))
+        self.bdt_query.setText(str(series.title or ""))
         self.bdt_album_number.setText("")
         self._clear_bedetheque_comparison_views(f"Série Komga sélectionnée : {series.title}\nRecherche Bedetheque en cours…")
         lib_id = self._library_id("bedetheque") or series.library_id
@@ -16321,7 +20986,7 @@ class MainWindow(QMainWindow):
             )
             self.log(f"✅ Bedetheque : {len(rows)} tomes Komga chargés pour {series.title}")
             self.search_bedetheque()
-        self.run_worker("Chargement tomes Komga pour Bedetheque", lambda: self.komga_api().books(lib_id, series.id), done)
+        self.run_worker("Chargement tomes Komga pour Bedetheque", lambda: self._cached_books(lib_id, series.id), done)
 
     def on_bedetheque_komga_book_selected(self) -> None:
         row = self._selected_row_index(self.bdt_komga_books_table)
@@ -16337,7 +21002,7 @@ class MainWindow(QMainWindow):
         # Prefer the Bedetheque-specific selection, then fallback to Explorer.
         row = self._selected_row_index(self.bdt_komga_series_table)
         if row >= 0 and row < len(self.bdt_komga_series_rows):
-            self.bdt_query.setText(clean_search_title(self.bdt_komga_series_rows[row].title))
+            self.bdt_query.setText(str(self.bdt_komga_series_rows[row].title or ""))
             self.search_bedetheque()
             return
         bid = self._selected_id_from_table(self.books_table)
@@ -16350,7 +21015,7 @@ class MainWindow(QMainWindow):
             if book is not None:
                 self.bdt_target_type.setCurrentText("book")
                 self.bdt_target_id.setText(bid)
-                self.bdt_query.setText(clean_search_title(book.title))
+                self.bdt_query.setText(str(book.title or ""))
                 self.bdt_album_number.setText(book.number)
                 self.search_bedetheque()
         elif sid:
@@ -16361,7 +21026,7 @@ class MainWindow(QMainWindow):
             if series is not None:
                 self.bdt_target_type.setCurrentText("series")
                 self.bdt_target_id.setText(sid)
-                self.bdt_query.setText(clean_search_title(series.title))
+                self.bdt_query.setText(str(series.title or ""))
                 self.search_bedetheque()
 
     def _format_search_attempts(self, attempts: List[Dict[str, Any]]) -> str:
@@ -16383,39 +21048,13 @@ class MainWindow(QMainWindow):
             parts.append(text)
         return "; ".join(parts)
 
-    def _build_manga_news_search_queries(self, query: str, *, max_queries: int = 2) -> List[str]:
+    def _build_manga_news_search_queries(self, query: str, *, max_queries: int = 3) -> List[str]:
         """Return conservative Manga News query variants.
 
-        Manga News searches become very slow on broad queries. Unlike the generic
-        fallback builder used for Bedetheque/MangaBaka, this intentionally avoids
-        first-token and heavily stripped variants such as ``Fairy`` or ``Creature``.
+        Slow one-word variants remain excluded, but apostrophe contractions and
+        parenthetical suffixes use the same shared rules as the other sources.
         """
-        variants: List[str] = []
-        seen: set[str] = set()
-
-        def add(candidate: Any) -> None:
-            value = clean_search_title(candidate)
-            key = value.casefold()
-            if value and key not in seen:
-                seen.add(key)
-                variants.append(value)
-
-        primary = clean_search_title(query)
-        add(primary)
-
-        # Controlled fallback only: remove short parenthetical edition/article
-        # fragments while preserving the full title. This handles titles such
-        # as ``Attaque Des Titans (L')`` without generating broad queries.
-        no_parens = re.sub(r"\s*[\(\[\{][^\)\]\}]{1,40}[\)\]\}]\s*", " ", str(query or ""))
-        add(no_parens)
-
-        # Controlled fallback for leading/trailing French article fragments.
-        # Keep at least two meaningful words to avoid slow generic searches.
-        article_spaced = re.sub(r"\b(?:l|le|la|les)\b", " ", primary, flags=re.IGNORECASE)
-        if len([x for x in article_spaced.split() if len(x) >= 3]) >= 2:
-            add(article_spaced)
-
-        return variants[:max(1, int(max_queries or 1))]
+        return build_conservative_search_queries(query, max_queries=max_queries)
 
     def _filter_manga_news_rows(self, rows: List[MangaNewsSearchResult], manga_only: bool) -> List[MangaNewsSearchResult]:
         if not manga_only:
@@ -16441,7 +21080,7 @@ class MainWindow(QMainWindow):
             titles.append(f"{getattr(row, 'title', '')}{suffix}")
         return titles
 
-    def _search_bedetheque_with_fallback(self, query: str, client: Optional[BedethequeClient] = None) -> Dict[str, Any]:
+    def _search_bedetheque_with_fallback(self, query: str, client: Optional[BedethequeCsvClient] = None) -> Dict[str, Any]:
         client = client or self.bedetheque_client()
         attempts: List[Dict[str, Any]] = []
         queries = build_search_queries(query)
@@ -16475,7 +21114,7 @@ class MainWindow(QMainWindow):
     def _search_manga_news_with_fallback(self, query: str, manga_only: bool, client: Optional[MangaNewsClient] = None) -> Dict[str, Any]:
         client = client or self.manga_news_client()
         attempts: List[Dict[str, Any]] = []
-        queries = self._build_manga_news_search_queries(query, max_queries=2)
+        queries = self._build_manga_news_search_queries(query, max_queries=3)
         last_raw_rows: List[MangaNewsSearchResult] = []
         last_filtered_rows: List[MangaNewsSearchResult] = []
         last_error = ""
@@ -16574,7 +21213,7 @@ class MainWindow(QMainWindow):
     def _search_comicvine_with_fallback(self, query: str, client: Optional[ComicVineClient] = None) -> Dict[str, Any]:
         client = client or self.comicvine_client()
         attempts: List[Dict[str, Any]] = []
-        queries = build_search_queries(query, max_queries=2)
+        queries = build_conservative_search_queries(query, max_queries=3)
         last_rows: List[ComicVineSearchResult] = []
         last_error = ""
         for candidate_query in queries:
@@ -16609,11 +21248,47 @@ class MainWindow(QMainWindow):
             "error": last_error,
         }
 
+    def _search_metron_with_fallback(self, query: str, client: Optional[MetronClient] = None) -> Dict[str, Any]:
+        client = client or self.metron_client()
+        attempts: List[Dict[str, Any]] = []
+        queries = build_conservative_search_queries(query, max_queries=3)
+        last_rows: List[MetronSearchResult] = []
+        last_error = ""
+        for candidate_query in queries:
+            started = time.monotonic()
+            try:
+                rows = client.search(candidate_query, limit=25)
+            except ExternalSourceBlocked:
+                raise
+            except Exception as exc:
+                duration_ms = round((time.monotonic() - started) * 1000, 2)
+                last_error = str(exc)
+                attempts.append({"query": candidate_query, "count": 0, "duration_ms": duration_ms, "error": last_error})
+                if "timeout" in last_error.casefold():
+                    break
+                continue
+            duration_ms = round((time.monotonic() - started) * 1000, 2)
+            attempts.append({"query": candidate_query, "count": len(rows), "duration_ms": duration_ms})
+            last_rows = rows
+            if rows:
+                return {
+                    "rows": rows,
+                    "used_query": candidate_query,
+                    "attempts": attempts,
+                    "primary_query": queries[0] if queries else query,
+                    "error": "",
+                }
+        return {
+            "rows": last_rows,
+            "used_query": queries[-1] if queries else query,
+            "attempts": attempts,
+            "primary_query": queries[0] if queries else query,
+            "error": last_error,
+        }
+
     def search_bedetheque(self) -> None:
         raw_query = self.bdt_query.text().strip()
         query = clean_search_title(raw_query)
-        if query != raw_query:
-            self.bdt_query.setText(query)
         if not query:
             QMessageBox.warning(self, "Bedetheque", "Recherche vide")
             return
@@ -16653,7 +21328,7 @@ class MainWindow(QMainWindow):
         self.bdt_raw.setPlainText(f"Recherche Bedetheque en cours…\nRequête : {query}\nSi aucun résultat ne revient, le détail des essais sera affiché ici.")
         self._set_table(self.bdt_results_table, ["Type", "Titre", "Score match", "URL"], [], stretch_from=1)
         self._reset_table_to_first_row(self.bdt_results_table)
-        self.run_worker("Recherche Bedetheque", lambda: self._search_bedetheque_with_fallback(query), done)
+        self.run_worker("Recherche Bedetheque", lambda: self._search_bedetheque_with_fallback(raw_query), done)
 
     def on_bedetheque_result_selected(self) -> None:
         row = self._selected_row_index(self.bdt_results_table)
@@ -16705,11 +21380,11 @@ class MainWindow(QMainWindow):
                     self.bdt_albums_status.setText("Aucun album Bedetheque extrait pour cette serie : la page peut etre bloquee, vide, ou dans un format non reconnu.")
             self._set_table(self.bdt_albums_table, ["#", "Titre", "URL"], [[a.get("number", ""), a.get("title", ""), a.get("url", "")] for a in albums], stretch_from=1)
             self._reset_table_to_first_row(self.bdt_albums_table, select=False)
-            self.bdt_raw.setPlainText(json_text(BedethequeClient.candidate_to_dict(candidate)))
+            self.bdt_raw.setPlainText(json_text(candidate_to_dict(candidate)))
             self.preview_bedetheque_series()
             self.match_bedetheque_tomes()
-            self.log(f"✅ Série Bedetheque scrapée : {candidate.series_title} ({len(albums)} albums)")
-        self.run_worker("Scrape série Bedetheque", lambda: self.bedetheque_client().scrape_series(result.url), done)
+            self.log(f"✅ Série Bedetheque chargée depuis le CSV : {candidate.series_title}")
+        self.run_worker("Chargement série CSV Bedetheque", lambda: self.bedetheque_client().scrape_series(result.url), done)
 
     def _selected_bedetheque_album(self) -> Dict[str, str]:
         if not self.bdt_series_candidate:
@@ -16721,47 +21396,15 @@ class MainWindow(QMainWindow):
         return albums[row]
 
     def scrape_selected_bedetheque_album(self) -> None:
-        album = self._selected_bedetheque_album()
-        if not album:
-            QMessageBox.warning(self, "Bedetheque", "Aucun album Bedetheque sélectionné")
-            return
-        url = album.get("url", "")
-        def done(candidate: BedethequeCandidate) -> None:
-            self.bdt_album_candidates_by_url[url] = candidate
-            self.bedetheque_candidate = candidate
-            self.bdt_raw.setPlainText(json_text(BedethequeClient.candidate_to_dict(candidate)))
-            self.match_bedetheque_tomes()
-            self.on_bedetheque_match_selected()
-            self.log(f"✅ Album Bedetheque scrapé : {candidate.album_title or url}")
-        self.run_worker("Scrape album Bedetheque", lambda: self.bedetheque_client().scrape_album(url), done)
+        QMessageBox.information(
+            self,
+            "Bedetheque",
+            "Le CSV Bedetheque ne contient pas de métadonnées par tome. "
+            "Aucune connexion au site ne sera effectuée.",
+        )
 
     def scrape_all_bedetheque_albums(self) -> None:
-        if not self.bdt_series_candidate:
-            QMessageBox.warning(self, "Bedetheque", "Scrape d'abord une série Bedetheque")
-            return
-        albums = self.bdt_series_candidate.raw.get("albums", []) if isinstance(self.bdt_series_candidate.raw, dict) else []
-        def do_scrape() -> Dict[str, Any]:
-            client = self.bedetheque_client()
-            done: Dict[str, Any] = {"ok": 0, "errors": []}
-            cache: Dict[str, BedethequeCandidate] = {}
-            for album in albums:
-                url = album.get("url", "")
-                if not url:
-                    continue
-                try:
-                    cache[url] = client.scrape_album(url)
-                    done["ok"] += 1
-                except ExternalSourceBlocked:
-                    raise
-                except Exception as exc:
-                    done["errors"].append({"url": url, "error": str(exc)})
-            return {"report": done, "cache": cache}
-        def done(result: Dict[str, Any]) -> None:
-            self.bdt_album_candidates_by_url.update(result["cache"])
-            self.bdt_raw.setPlainText(json_text(result["report"]))
-            self.match_bedetheque_tomes()
-            self.log(f"✅ Scrape albums terminé : {result['report']['ok']} OK, {len(result['report']['errors'])} erreurs")
-        self.run_worker("Scrape tous albums Bedetheque", do_scrape, done)
+        self.scrape_selected_bedetheque_album()
 
     def match_bedetheque_tomes(self) -> None:
         if not self.bdt_series_candidate:
@@ -16881,14 +21524,10 @@ class MainWindow(QMainWindow):
         candidate = self.bdt_album_candidates_by_url.get(album.get("url", ""))
         current = book.metadata or {}
         if not candidate and album.get("url"):
-            # UX: remplir le diff du tome dès qu'une ligne matchée est sélectionnée.
-            # L'utilisateur ne doit pas devoir deviner qu'il faut cliquer un autre bouton.
-            self.bdt_book_preview.setPlainText("Scrape automatique de l'album Bedetheque sélectionné…")
-            url = album.get("url", "")
-            def done(scraped: BedethequeCandidate) -> None:
-                self.bdt_album_candidates_by_url[url] = scraped
-                self.on_bedetheque_match_selected()
-            self.run_worker("Scrape auto album Bedetheque", lambda: self.bedetheque_client().scrape_album(url), done)
+            self.bdt_book_preview.setPlainText(
+                "Métadonnées par tome absentes du CSV Bedetheque. "
+                "Aucune connexion au site ne sera effectuée."
+            )
             return
         proposed = candidate.book_metadata if candidate else {}
         self._fill_metadata_table(self.bdt_book_metadata_table, current, proposed, BOOK_METADATA_FIELDS)
@@ -16932,7 +21571,7 @@ class MainWindow(QMainWindow):
         def do_apply() -> Any:
             api = self.komga_api()
             current = self._fetch_current_metadata("series", series_id)
-            self.backup.save_json("operation", "series", series_id, {"current": current, "bedetheque": BedethequeClient.candidate_to_dict(self.bdt_series_candidate) if self.bdt_series_candidate else {}}, "avant PATCH Bedetheque série")
+            self.backup.save_json("operation", "series", series_id, {"current": current, "bedetheque": candidate_to_dict(self.bdt_series_candidate) if self.bdt_series_candidate else {}}, "avant PATCH Bedetheque série")
             return self._write_metadata_update(api, "series", series_id, payload, current, source="bedetheque_manual", note="Application Bedetheque série")
         self.run_worker("Application Bedetheque série", do_apply, lambda r: self.log(f"✅ Metadata Bedetheque appliquée sur série:{series_id}"))
 
@@ -16996,7 +21635,7 @@ class MainWindow(QMainWindow):
         def do_apply() -> Any:
             api = self.komga_api()
             current = self._fetch_current_metadata("book", book.id)
-            self.backup.save_json("operation", "book", book.id, {"current": current, "bedetheque": BedethequeClient.candidate_to_dict(candidate), "payload": payload}, "avant PATCH Bedetheque tome")
+            self.backup.save_json("operation", "book", book.id, {"current": current, "bedetheque": candidate_to_dict(candidate), "payload": payload}, "avant PATCH Bedetheque tome")
             return self._write_metadata_update(api, "book", book.id, payload, current, source="bedetheque_book_manual", note="Application Bedetheque tome")
         self.run_worker("Application Bedetheque tome", do_apply, lambda r: self.log(f"✅ Metadata Bedetheque appliquée sur book:{book.id}"))
 
@@ -17031,7 +21670,6 @@ class MainWindow(QMainWindow):
         progress: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         api = self.komga_api()
-        client = self.bedetheque_client()
         rows: List[Dict[str, Any]] = []
         total = len(contexts)
         for index, ctx in enumerate(contexts, start=1):
@@ -17057,25 +21695,25 @@ class MainWindow(QMainWindow):
                 else:
                     candidate = self.bdt_album_candidates_by_url.get(album.get("url", ""))
                     if not candidate:
-                        candidate = client.scrape_album(album.get("url", ""))
-                        self.bdt_album_candidates_by_url[album.get("url", "")] = candidate
-                    current = self._fetch_current_metadata("book", book.id)
-                    payload = self._payload_from_metadata_maps(current, candidate.book_metadata, BOOK_METADATA_FIELDS, target_type="book")
-                    report["payload_fields"] = "; ".join(payload.keys())
-                    if not payload:
-                        report["status"] = "OK : aucun changement"
-                    elif simulation:
-                        report["status"] = "OK simulation"
+                        report["status"] = "Ignoré : métadonnées tome absentes du CSV"
                     else:
-                        self.backup.save_json(
-                            "operation",
-                            "book",
-                            book.id,
-                            {"current": current, "bedetheque": BedethequeClient.candidate_to_dict(candidate), "payload": payload},
-                            "avant PATCH Bedetheque tomes",
-                        )
-                        self._write_metadata_update(api, "book", book.id, payload, current, source="bedetheque_books_multi", note="Application Bedetheque tomes")
-                        report["status"] = "OK appliqué"
+                        current = self._fetch_current_metadata("book", book.id)
+                        payload = self._payload_from_metadata_maps(current, candidate.book_metadata, BOOK_METADATA_FIELDS, target_type="book")
+                        report["payload_fields"] = "; ".join(payload.keys())
+                        if not payload:
+                            report["status"] = "OK : aucun changement"
+                        elif simulation:
+                            report["status"] = "OK simulation"
+                        else:
+                            self.backup.save_json(
+                                "operation",
+                                "book",
+                                book.id,
+                                {"current": current, "bedetheque": candidate_to_dict(candidate), "payload": payload},
+                                "avant PATCH Bedetheque tomes",
+                            )
+                            self._write_metadata_update(api, "book", book.id, payload, current, source="bedetheque_books_multi", note="Application Bedetheque tomes")
+                            report["status"] = "OK appliqué"
             except Exception as exc:
                 report["status"] = "Erreur"
                 report["error"] = str(exc)

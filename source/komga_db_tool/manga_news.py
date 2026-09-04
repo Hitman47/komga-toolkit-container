@@ -5,9 +5,14 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 from urllib import error, parse, request
+
+from .bedetheque import title_similarity
+from .metadata_cleanup import filter_incoming_alternate_titles, title_script_language
+from .metadata_quality import build_conservative_search_queries
 
 APP_USER_AGENT = "komga-db-tool/3.9.11 manga-news-v2-adapter"
 DEFAULT_MANGA_NEWS_API_BASE_URL = "http://192.168.1.30:8017"
@@ -16,10 +21,16 @@ LOOKUP_CACHE_TTL_SECONDS = 12 * 60 * 60
 V2_REQUIRED_PATHS = {"/health", "/search", "/search/resolve", "/series/{slug}", "/series/by-url"}
 V2_VOLUME_PATHS = {"/volume/{series_slug}/{volume_slug}", "/volume/{series_slug}/number/{number}", "/volume/by-url"}
 V2_NEXT_RELEASE_PATHS = {"/series/{slug}/release-state"}
+V2_EDITION_PATHS = {"/search/editions", "/series/{slug}/edition-groups"}
 V2_SERIES_FIELDS = (
     "title,title_vo,translated_title,type,summary,authors_story,authors_art,"
-    "translators,publisher_fr,publisher_vo,vf,vo,genres,advisory_age,"
+    "translators,publisher_fr,publisher_vo,origin,vf,vo,genres,advisory_age,"
     "cover_image,source_url"
+)
+V2_VOLUME_FIELDS = (
+    "title,number,summary,publication_date,isbn_ean,"
+    "publisher_fr,publisher_vo,illustration,illustration_details,cover_image,"
+    "source_url,authors_story,authors_art,translators"
 )
 V2_SEARCH_PARAMETERS = {
     "q",
@@ -70,6 +81,17 @@ class MangaNewsSearchResult:
     translated_title: str = ""
     vf_status: str = ""
     vf_volumes: str = ""
+    edition_key: str = ""
+    edition_label: str = ""
+    edition_display_name: str = ""
+    edition_volume_count: Optional[int] = None
+    edition_total_volumes: Optional[int] = None
+    edition_highest_volume_number: Optional[int] = None
+    edition_status: str = ""
+    edition_status_source: str = ""
+    edition_status_confidence: str = ""
+    edition_status_reason: str = ""
+    edition_preferred: bool = False
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -134,12 +156,183 @@ def series_slug_from_manga_news_url(url: str) -> str:
     return ""
 
 
+def manga_news_edition_label_from_url(url: Any) -> str:
+    """Return the persisted Manga News edition selector from a Komga link."""
+    text = _safe_str(url)
+    if not text:
+        return ""
+    parsed = parse.urlsplit(text if "://" in text else "https://" + text)
+    host = parsed.netloc.casefold().removeprefix("www.")
+    if "manga-news.com" not in host:
+        return ""
+    values = parse.parse_qs(parsed.query, keep_blank_values=False).get("edition_label") or []
+    return _safe_str(values[0]) if values else ""
+
+
+def manga_news_url_with_edition(url: Any, edition_label: Any) -> str:
+    """Persist an edition selector without changing the Manga News series slug."""
+    text = _safe_str(url)
+    label = _safe_str(edition_label)
+    if not text or not label:
+        return text
+    parsed = parse.urlsplit(text if "://" in text else "https://" + text)
+    query = [
+        (key, value)
+        for key, value in parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key.casefold() != "edition_label"
+    ]
+    query.append(("edition_label", label))
+    return parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parse.urlencode(query), parsed.fragment))
+
+
+def merge_manga_news_edition_links(current: Any, candidate: Any) -> List[Dict[str, str]]:
+    """Replace the Manga News link selected edition while preserving other links."""
+
+    def entries(value: Any) -> List[Dict[str, str]]:
+        rows = value if isinstance(value, (list, tuple)) else [value]
+        result: List[Dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            url = _safe_str(row.get("url") or row.get("href") or row.get("link"))
+            if not url:
+                continue
+            label = _safe_str(row.get("label") or row.get("name")) or "link"
+            item = {"label": label, "url": url}
+            if item not in result:
+                result.append(item)
+        return result
+
+    candidate_entries = entries(candidate)
+    edition_entries = [row for row in candidate_entries if manga_news_edition_label_from_url(row.get("url"))]
+    if not edition_entries:
+        return candidate_entries
+    result: List[Dict[str, str]] = []
+    for row in entries(current):
+        url = row.get("url", "")
+        parsed = parse.urlsplit(url if "://" in url else "https://" + url)
+        if "manga-news.com" in parsed.netloc.casefold():
+            continue
+        result.append(row)
+    for row in candidate_entries:
+        if row not in result:
+            result.append(row)
+    return result
+
+
 def _safe_str(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value).strip()
+
+
+_EDITION_HINT_WORDS = {
+    "artbook",
+    "collector",
+    "deluxe",
+    "double",
+    "grand format",
+    "kanzenban",
+    "originale",
+    "original",
+    "perfect",
+    "speciale",
+    "special",
+    "triple",
+    "ultimate",
+}
+
+
+def _fold_edition_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", _safe_str(value))
+    text = "".join(char for char in text if not unicodedata.combining(char)).casefold()
+    text = re.sub(r"[_\W]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _edition_match_key(value: Any) -> str:
+    text = _fold_edition_text(value)
+    text = re.sub(r"\b(?:edition|ed|de|la|le|l)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_manga_news_edition_title(value: Any) -> tuple[str, str]:
+    """Return ``(base title, edition hint)`` for explicit edition suffixes.
+
+    Only an explicit parenthetical/bracketed suffix or a dash suffix containing
+    a known edition marker is removed. Ordinary title parentheticals therefore
+    keep using the historical Manga News search.
+    """
+    title = re.sub(r"\s+", " ", _safe_str(value)).strip()
+    if not title:
+        return "", ""
+    match = re.search(r"\s*[\(\[\{]([^\)\]\}]{1,80})[\)\]\}]\s*$", title)
+    if not match:
+        match = re.search(
+            r"\s+-\s+((?:[ée]dition\b.+)|(?:.+\b[ée]dition)|(?:perfect|deluxe|collector|ultimate|kanzenban|double|triple|grand\s+format))\s*$",
+            title,
+            flags=re.IGNORECASE,
+        )
+    if not match:
+        # Komga titles commonly use a bare suffix (for example
+        # "Eagle Perfect Edition") rather than parentheses or a dash. Only
+        # accept an explicit "edition" phrase here so ordinary titles ending
+        # in words such as "Perfect" keep their historical search behavior.
+        words = title.split()
+        for size in range(min(5, len(words) - 1), 1, -1):
+            hint_start = len(words) - size
+            hint = " ".join(words[hint_start:])
+            folded_hint = _fold_edition_text(hint)
+            without_edition = re.sub(r"\bedition\b", " ", folded_hint)
+            without_edition = re.sub(r"\b\d+(?:re|ere|e)?\b", " ", without_edition)
+            without_edition = re.sub(r"\s+", " ", without_edition).strip()
+            if "edition" in folded_hint and (
+                without_edition in _EDITION_HINT_WORDS
+                or any(without_edition == word for word in _EDITION_HINT_WORDS)
+            ):
+                base = " ".join(words[:hint_start]).strip(" -–—")
+                return (base or title), hint
+    if not match:
+        return title, ""
+    hint = re.sub(r"\s+", " ", match.group(1)).strip()
+    folded = _fold_edition_text(hint)
+    known = "edition" in folded or any(word in folded for word in _EDITION_HINT_WORDS)
+    if not known:
+        return title, ""
+    base = re.sub(r"\s+", " ", title[: match.start()]).strip(" -–—")
+    return (base or title), hint
+
+
+def _matching_edition_group(groups: List[Dict[str, Any]], hint: Any) -> Optional[Dict[str, Any]]:
+    wanted = _edition_match_key(hint)
+    if not wanted:
+        return None
+    wanted_tokens = set(wanted.split())
+    ranked: List[tuple[int, Dict[str, Any]]] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        aliases = {
+            _edition_match_key(group.get("edition_label")),
+            _edition_match_key(group.get("display_name")),
+            _edition_match_key(group.get("raw_heading")),
+        }
+        aliases.discard("")
+        score = 0
+        if wanted in aliases:
+            score = 100
+        elif any(set(alias.split()) == wanted_tokens for alias in aliases):
+            score = 95
+        elif any(wanted in alias or alias in wanted for alias in aliases):
+            score = 80
+        if score:
+            ranked.append((score, group))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    if not ranked or (len(ranked) > 1 and ranked[0][0] == ranked[1][0]):
+        return None
+    return ranked[0][1]
 
 
 def _series_data(payload: Any) -> Dict[str, Any]:
@@ -417,24 +610,29 @@ def candidate_from_series_next_release(payload: Any, slug: str = "") -> MangaNew
     release_date = _date_value(data.get("next_release_date") or data.get("nextReleaseDate"))
     vf = data.get("vf") if isinstance(data.get("vf"), dict) else {}
     volumes = _int_or_none(vf.get("volumes"))
-    if not release_date or volumes is None:
+    if not release_date:
         raw = payload if isinstance(payload, dict) else {"raw": payload}
         return MangaNewsNextReleaseCandidate(raw=raw)
-    number = str(volumes + 1)
     source_url = _safe_str(data.get("source_url") or (payload.get("source_url") if isinstance(payload, dict) else ""))
     title = _safe_str(data.get("title") or slug)
     raw = dict(payload) if isinstance(payload, dict) else {"raw": payload}
+    warnings = list(raw.get("warnings") or []) if isinstance(raw.get("warnings"), list) else []
+    warnings.append(
+        "Manga News fournit une date de prochaine sortie, mais aucun numéro de tome explicite ; "
+        "aucun tag nextrelease ne peut être proposé."
+    )
+    raw["warnings"] = warnings
     raw["fallback"] = {
         "source": "series.next_release_date",
-        "reason": "release-state sans next_release exploitable",
+        "reason": "date série sans numéro de tome explicite",
         "request_slug": slug,
-        "inferred_from": "vf.volumes + 1",
+        "applicable": False,
         "vf_volumes": volumes,
     }
     return MangaNewsNextReleaseCandidate(
         source_url=source_url,
-        title=f"{title} - Tome {number}" if title else f"Tome {number}",
-        number=number,
+        title=title,
+        number="",
         release_date=release_date,
         raw=raw,
     )
@@ -516,20 +714,25 @@ def _author_entries(names: Any, role: str) -> List[Dict[str, str]]:
 
 def _alternate_title_entries(data: Dict[str, Any]) -> List[Dict[str, str]]:
     title = _safe_str(data.get("title"))
-    candidates = [data.get("title_vo"), data.get("translated_title")]
+    origin = _safe_str(data.get("origin")).casefold()
+    origin_language = ""
+    if any(token in origin for token in ("japon", "japan")):
+        origin_language = "ja"
+    elif any(token in origin for token in ("corée", "coree", "korea")):
+        origin_language = "ko"
+    elif any(token in origin for token in ("chine", "china")):
+        origin_language = "zh"
+    candidates = [
+        (title_script_language(data.get("title_vo")) or origin_language or "alt", data.get("title_vo")),
+        ("fr", data.get("translated_title")),
+    ]
     out: List[Dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for raw in candidates:
+    for label, raw in candidates:
         text = _safe_str(raw)
         if not text or (title and text.casefold() == title.casefold()):
             continue
-        label = _alternate_title_label(text)
-        key = (label.casefold(), text.casefold())
-        if key in seen:
-            continue
-        seen.add(key)
         out.append({"label": label, "title": text})
-    return out
+    return filter_incoming_alternate_titles(out, primary_title=title)
 
 
 def _map_series_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -540,6 +743,7 @@ def _map_series_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     tags/genres. Those were observed to pollute curated Kora tags.
     """
     metadata: Dict[str, Any] = {}
+    metadata["language"] = "fr"
 
     title = _safe_str(data.get("title"))
     if title:
@@ -594,6 +798,7 @@ def _map_series_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _map_volume_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
+    metadata["language"] = "fr"
     title = _safe_str(data.get("title") or data.get("name"))
     if title:
         metadata["title"] = title
@@ -608,7 +813,7 @@ def _map_volume_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     release_date = _date_value(data.get("release_date") or data.get("date") or data.get("published_at") or data.get("publication_date"))
     if release_date:
         metadata["releaseDate"] = release_date
-    isbn = _safe_str(data.get("isbn") or data.get("ean"))
+    isbn = _safe_str(data.get("isbn") or data.get("ean") or data.get("isbn_ean"))
     if isbn:
         metadata["isbn"] = isbn
     publisher = _safe_str(data.get("publisher_fr") or data.get("publisher") or data.get("publisher_vo"))
@@ -663,6 +868,58 @@ def _search_result_from_item(item: Dict[str, Any]) -> MangaNewsSearchResult:
         vf_volumes=_edition_volumes_text(vf),
         raw=item,
     )
+
+
+def _edition_search_results(payload: Any, requested_title: str = "") -> List[MangaNewsSearchResult]:
+    data = _series_data(payload)
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    _, hint = split_manga_news_edition_title(requested_title)
+    rows: List[MangaNewsSearchResult] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        base_slug = _safe_str(result.get("slug") or result.get("series_slug"))
+        base_title = _safe_str(result.get("title") or base_slug)
+        base_url = _safe_str(result.get("source_url") or result.get("url"))
+        score = _int_or_none(result.get("score")) or 0
+        groups = [group for group in (result.get("edition_groups") or result.get("groups") or []) if isinstance(group, dict)]
+        preferred = _matching_edition_group(groups, hint)
+        for group in groups:
+            edition_label = _safe_str(group.get("edition_label"))
+            display_name = _safe_str(group.get("display_name") or group.get("raw_heading") or edition_label)
+            volume_count = _int_or_none(group.get("volume_count"))
+            total_volumes = _int_or_none(group.get("total_volumes"))
+            highest = _int_or_none(group.get("highest_volume_number"))
+            status = _safe_str(group.get("status"))
+            group_raw = dict(group)
+            group_raw["base_slug"] = base_slug
+            group_raw["base_title"] = base_title
+            group_raw["base_source_url"] = base_url
+            rows.append(
+                MangaNewsSearchResult(
+                    slug=base_slug,
+                    title=f"{base_title} — {display_name}" if display_name else base_title,
+                    kind="series_edition",
+                    score=score,
+                    url=base_url,
+                    media_kind="manga",
+                    vf_status=status,
+                    vf_volumes=_safe_str(total_volumes if total_volumes is not None else volume_count),
+                    edition_key=f"{base_slug}::{edition_label}",
+                    edition_label=edition_label,
+                    edition_display_name=display_name,
+                    edition_volume_count=volume_count,
+                    edition_total_volumes=total_volumes,
+                    edition_highest_volume_number=highest,
+                    edition_status=status,
+                    edition_status_source=_safe_str(group.get("status_source")),
+                    edition_status_confidence=_safe_str(group.get("status_confidence")),
+                    edition_status_reason=_safe_str(group.get("status_reason")),
+                    edition_preferred=group is preferred,
+                    raw=group_raw,
+                )
+            )
+    return rows
 
 
 def candidate_from_series(payload: Dict[str, Any], slug_hint: str = "") -> MangaNewsCandidate:
@@ -873,6 +1130,8 @@ class MangaNewsClient:
             raise RuntimeError("API Manga News incompatible avec l'enrichissement tome : route volume absente")
         if not self._validate_v2_next_release_routes(contract):
             raise RuntimeError("API Manga News incompatible avec les prochaines sorties : route release-state absente")
+        if not self._validate_v2_edition_routes(contract):
+            raise RuntimeError("API Manga News incompatible avec les autres éditions : routes edition-groups absentes")
         return f"Manga News v2 OK — contrat {version}, routes et paramètres compatibles"
 
     @staticmethod
@@ -913,6 +1172,13 @@ class MangaNewsClient:
             return False
         paths = contract.get("paths") if isinstance(contract.get("paths"), dict) else {}
         return bool(V2_NEXT_RELEASE_PATHS & set(paths))
+
+    @staticmethod
+    def _validate_v2_edition_routes(contract: Any) -> bool:
+        if not isinstance(contract, dict):
+            return False
+        paths = contract.get("paths") if isinstance(contract.get("paths"), dict) else {}
+        return V2_EDITION_PATHS.issubset(set(paths))
 
     def resolve(self, query: str, limit: int = 5, manga_only: bool = True) -> List[MangaNewsSearchResult]:
         """Resolve a query with the lightest API route usable for prudent auto-match."""
@@ -958,6 +1224,114 @@ class MangaNewsClient:
         rows = [_search_result_from_item(item) for item in _result_items(payload)]
         return [row for row in rows if row.kind == "series" or not row.kind]
 
+    def search_editions(self, query: str, limit: int = 10) -> List[MangaNewsSearchResult]:
+        requested_title = _safe_str(query)
+        base_title, _ = split_manga_news_edition_title(requested_title)
+        if not base_title:
+            return []
+        rows: List[MangaNewsSearchResult] = []
+        for candidate_query in build_conservative_search_queries(base_title, max_queries=3) or [base_title]:
+            payload = self._get_json(
+                "/search/editions",
+                query={
+                    "q": candidate_query,
+                    "mode": "best",
+                    "limit": max(1, min(int(limit or 10), 50)),
+                    "include_volumes": "false",
+                },
+                ttl_seconds=SEARCH_CACHE_TTL_SECONDS,
+            )
+            rows = _edition_search_results(payload, requested_title)
+            if rows:
+                break
+        return rows
+
+    def get_series_edition_groups(self, slug: str) -> List[Dict[str, Any]]:
+        series_slug = _safe_str(slug)
+        if not series_slug:
+            raise ValueError("Slug Manga News vide")
+        payload = self._get_json(
+            f"/series/{parse.quote(series_slug, safe='')}/edition-groups",
+            query={"include_volumes": "false"},
+            ttl_seconds=LOOKUP_CACHE_TTL_SECONDS,
+        )
+        data = _series_data(payload)
+        return [group for group in (data.get("groups") or []) if isinstance(group, dict)]
+
+    def get_series_edition(
+        self,
+        slug: str,
+        edition_label: str,
+        *,
+        target_title: str = "",
+        edition_group: Optional[Dict[str, Any]] = None,
+    ) -> MangaNewsCandidate:
+        series_slug = _safe_str(slug)
+        label = _safe_str(edition_label)
+        if not series_slug or not label:
+            raise ValueError("Slug série ou édition Manga News vide")
+        group = dict(edition_group or {})
+        if _safe_str(group.get("edition_label")) != label:
+            groups = self.get_series_edition_groups(series_slug)
+            group = next((dict(item) for item in groups if _safe_str(item.get("edition_label")) == label), {})
+        if not group:
+            raise LookupError(f"Édition Manga News introuvable : {label}")
+
+        base = self.get_series(series_slug)
+        metadata: Dict[str, Any] = {"language": "fr"}
+        summary = _safe_str(base.series_metadata.get("summary") or base.summary)
+        if summary:
+            metadata["summary"] = summary
+        status = _normalize_status(group.get("status"))
+        if status:
+            metadata["status"] = status
+        total = _int_or_none(group.get("total_volumes"))
+        if total is None:
+            total = _int_or_none(group.get("volume_count"))
+        if total is not None:
+            metadata["totalBookCount"] = total
+
+        base_url = base.source_url or (
+            "https://www.manga-news.com/index.php/serie/" + parse.quote(series_slug, safe="-._~")
+        )
+        edition_url = manga_news_url_with_edition(base_url, label)
+        if edition_url:
+            metadata["links"] = [_make_link("Manga-News", edition_url)]
+
+        display_name = _safe_str(group.get("display_name") or group.get("raw_heading") or label)
+        display_title = _safe_str(target_title) or (
+            f"{base.title} ({display_name})" if display_name else base.title
+        )
+        raw = {
+            "base_series": base.raw,
+            "edition_group": group,
+            "edition_label": label,
+            "status_source": _safe_str(group.get("status_source")),
+            "status_confidence": _safe_str(group.get("status_confidence")),
+            "status_reason": _safe_str(group.get("status_reason")),
+        }
+        return MangaNewsCandidate(
+            source_url=edition_url or base.source_url,
+            slug=series_slug,
+            title=display_title,
+            summary=summary,
+            cover_url=base.cover_url,
+            series_metadata=metadata,
+            raw=raw,
+        )
+
+    def get_series_edition_by_hint(self, slug: str, hint: str, *, target_title: str = "") -> MangaNewsCandidate:
+        groups = self.get_series_edition_groups(slug)
+        group = _matching_edition_group(groups, hint)
+        if group is None:
+            raise LookupError(f"Aucune édition Manga News unique pour : {hint}")
+        return self.get_series_edition(
+            slug,
+            _safe_str(group.get("edition_label")),
+            target_title=target_title,
+            edition_group=group,
+        )
+
     def get_series(self, slug: str) -> MangaNewsCandidate:
         sid = _safe_str(slug)
         if not sid:
@@ -996,7 +1370,7 @@ class MangaNewsClient:
             f"/volume/{parse.quote(series_id, safe='')}/{parse.quote(volume_id, safe='')}",
             query={
                 "include_raw_sections": "false",
-                "fields": "title,number,volume_number,summary,synopsis,description,release_date,date,isbn,ean,publisher_fr,publisher_vo,illustration,illustration_details,cover_image,source_url,authors_story,authors_art,translators",
+                "fields": V2_VOLUME_FIELDS,
             },
             ttl_seconds=LOOKUP_CACHE_TTL_SECONDS,
         )
@@ -1011,26 +1385,91 @@ class MangaNewsClient:
             query={
                 "url": target_url,
                 "include_raw_sections": "false",
-                "fields": "title,number,volume_number,summary,synopsis,description,release_date,date,isbn,ean,publisher_fr,publisher_vo,illustration,illustration_details,cover_image,source_url,authors_story,authors_art,translators",
+                "fields": V2_VOLUME_FIELDS,
             },
             ttl_seconds=LOOKUP_CACHE_TTL_SECONDS,
         )
         return candidate_from_volume(payload, "", "")
 
-    def get_volume_by_number(self, series_slug: str, number: Any) -> MangaNewsVolumeCandidate:
+    def get_volume_by_number(self, series_slug: str, number: Any, edition_label: str = "") -> MangaNewsVolumeCandidate:
         series_id = _safe_str(series_slug)
         volume_number = _safe_str(number)
         if not series_id or not volume_number:
             raise ValueError("Slug série ou numéro de tome Manga News vide")
+        query = {
+            "include_raw_sections": "false",
+            "include_special": "false",
+        }
+        edition = _safe_str(edition_label)
+        if edition:
+            query["edition_label"] = edition
         payload = self._get_json(
             f"/volume/{parse.quote(series_id, safe='')}/number/{parse.quote(volume_number, safe='')}",
-            query={
-                "include_raw_sections": "false",
-                "include_special": "false",
-            },
+            query=query,
             ttl_seconds=LOOKUP_CACHE_TTL_SECONDS,
         )
         return candidate_from_volume(payload, series_id, volume_number)
+
+    def get_volume_without_number(
+        self,
+        series_slug: str,
+        title: str,
+        edition_label: str = "",
+    ) -> MangaNewsVolumeCandidate:
+        """Resolve a linked one-shot through volume search, then load it by URL."""
+        series_id = _safe_str(series_slug)
+        target_title = _safe_str(title) or series_id.replace("-", " ")
+        if not series_id or not target_title:
+            raise ValueError("Slug série ou titre de one-shot Manga News vide")
+        payload = self._get_json(
+            "/search",
+            query={
+                "q": target_title,
+                "kind": "volume",
+                "mode": "all",
+                "limit": 20,
+                "enrich": "false",
+                "include_editions": "false",
+                "prefer_main_series": "true",
+                "include_related": "true",
+                "include_books": "false",
+            },
+            ttl_seconds=SEARCH_CACHE_TTL_SECONDS,
+        )
+        requested_slug = _fold_edition_text(series_id)
+        requested_edition = _edition_match_key(edition_label)
+        ranked: List[tuple[float, Dict[str, Any]]] = []
+        for item in _result_items(payload):
+            if _safe_str(item.get("kind")).casefold() != "volume":
+                continue
+            if _safe_str(item.get("number") or item.get("number_int")):
+                continue
+            url = _safe_str(item.get("url") or item.get("source_url"))
+            candidate_slug = _safe_str(item.get("series_slug")) or series_slug_from_manga_news_url(url)
+            if _fold_edition_text(candidate_slug) != requested_slug:
+                continue
+            candidate_edition = _edition_match_key(item.get("edition_label"))
+            if requested_edition and candidate_edition != requested_edition:
+                continue
+            if not requested_edition and candidate_edition not in {"", "original", "originale"}:
+                continue
+            if not url:
+                continue
+            ranked.append((title_similarity(target_title, _safe_str(item.get("title"))), item))
+        if not ranked:
+            raise LookupError(f"One-shot Manga News sans numéro introuvable : {target_title}")
+        ranked.sort(key=lambda row: row[0], reverse=True)
+        if len(ranked) > 1 and ranked[0][0] < ranked[1][0] + 0.08:
+            raise LookupError(f"Plusieurs one-shots Manga News possibles : {target_title}")
+        score, selected = ranked[0]
+        selected_url = _safe_str(selected.get("url") or selected.get("source_url"))
+        candidate = self.get_volume_by_url(selected_url)
+        candidate.raw["_match"] = {
+            "strategy": "linked_one_shot_without_number",
+            "score": round(score, 3),
+            "search_result": dict(selected),
+        }
+        return candidate
 
     def get_next_release(self, slug: str = "", url: str = "") -> MangaNewsNextReleaseCandidate:
         series_slug = _safe_str(slug)
@@ -1064,7 +1503,7 @@ class MangaNewsClient:
                 return candidate
             errors.append(f"{path}: aucune prochaine sortie exploitable")
             fallback = self._get_series_next_release_fallback(series_slug)
-            if fallback.number and fallback.release_date:
+            if fallback.release_date:
                 raw = fallback.raw if isinstance(fallback.raw, dict) else {"raw": fallback.raw}
                 raw = dict(raw)
                 raw["errors"] = errors

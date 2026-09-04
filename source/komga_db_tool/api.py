@@ -173,6 +173,7 @@ class BookItem:
     library_id: str
     title: str
     number: str = ""
+    series_title: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -421,6 +422,41 @@ class KomgaApi:
                 continue
         raise RuntimeError(f"Aucun body de recherche compatible pour {path}. Erreurs: {' | '.join(errors)}")
 
+    def _list_page_with_fallback(
+        self,
+        path: str,
+        bodies: List[Dict[str, Any]],
+        sort: str,
+        page: int,
+        page_size: int,
+    ) -> Dict[str, Any]:
+        errors: List[str] = []
+        for body in bodies:
+            try:
+                with KOMGA_LIST_LOCK:
+                    data = self.client.request_json(
+                        "POST",
+                        path,
+                        body=body,
+                        query={"page": max(0, int(page)), "size": max(1, int(page_size)), "sort": sort},
+                    )
+                if isinstance(data, dict):
+                    return data
+                return {
+                    "content": _page_items(data),
+                    "number": max(0, int(page)),
+                    "size": max(1, int(page_size)),
+                    "totalElements": len(_page_items(data)),
+                    "totalPages": 1,
+                    "last": True,
+                }
+            except HttpError as exc:
+                if exc.status == 400:
+                    errors.append(f"body={body!r}: {exc.body[:300]}")
+                    continue
+                raise
+        raise RuntimeError(f"Aucun body de recherche compatible pour {path}. Erreurs: {' | '.join(errors)}")
+
     def series(self, library_id: Optional[str] = None, search: str = "", page_size: int = 500) -> List[SeriesItem]:
         conditions = []
         if library_id:
@@ -436,7 +472,12 @@ class KomgaApi:
         # Compatibility fallback only if the Search DSL changes: still post/list, never deprecated GET.
         legacy_body = {"libraryIds": [library_id] if library_id else [], "search": search}
         fallback_bodies.append({k: v for k, v in legacy_body.items() if v})
-        fallback_bodies.append({"fullTextSearch": search} if search else {})
+        # A compatibility fallback must never silently broaden a library-scoped
+        # request to every library.  Returning unrelated rows is worse than a
+        # visible compatibility error and used to make the UI look as though
+        # its library selector was ignored.
+        if not library_id:
+            fallback_bodies.append({"fullTextSearch": search} if search else {})
 
         data_rows = self._list_with_fallback("/api/v1/series/list", fallback_bodies, "metadata.titleSort,asc", page_size)
         out: List[SeriesItem] = []
@@ -457,6 +498,66 @@ class KomgaApi:
                 )
             )
         return out
+
+    def series_page(
+        self,
+        library_id: Optional[str] = None,
+        search: str = "",
+        *,
+        page: int = 0,
+        page_size: int = 40,
+    ) -> Dict[str, Any]:
+        """Return one Komga series page without loading the complete library."""
+        page = max(0, int(page))
+        page_size = min(200, max(1, int(page_size)))
+        conditions = []
+        if library_id:
+            conditions.append(_condition_for("libraryId", library_id))
+        body: Dict[str, Any] = {}
+        condition = _all_of(conditions)
+        if condition:
+            body["condition"] = condition
+        if search:
+            body["fullTextSearch"] = search
+        legacy = {
+            "libraryIds": [library_id] if library_id else [],
+            "search": search,
+        }
+        bodies = [body, {key: value for key, value in legacy.items() if value}]
+        if not library_id:
+            bodies.append({"fullTextSearch": search} if search else {})
+        data = self._list_page_with_fallback(
+            "/api/v1/series/list",
+            bodies,
+            "metadata.titleSort,asc",
+            page,
+            page_size,
+        )
+        parsed: List[SeriesItem] = []
+        for item in _page_items(data):
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            lib = item.get("library") if isinstance(item.get("library"), dict) else {}
+            item_lib = safe_str(item.get("libraryId") or lib.get("id") or "")
+            if library_id and item_lib and item_lib != library_id:
+                continue
+            parsed.append(SeriesItem(
+                id=safe_str(item.get("id")),
+                library_id=item_lib or safe_str(library_id or ""),
+                title=safe_str(meta.get("title") or item.get("name") or item.get("title") or item.get("id")),
+                book_count=safe_str(item.get("bookCount") or item.get("booksCount") or ""),
+                metadata=meta,
+                raw=item,
+            ))
+        total = int(data.get("totalElements", len(parsed)) or 0)
+        total_pages = int(data.get("totalPages", 1 if total else 0) or 0)
+        return {
+            "items": parsed,
+            "page": int(data.get("number", page) or 0),
+            "size": int(data.get("size", page_size) or page_size),
+            "total": total,
+            "total_pages": total_pages,
+            "last": bool(data.get("last", page + 1 >= total_pages)),
+        }
 
     def books(
         self,
@@ -479,6 +580,8 @@ class KomgaApi:
                 item_lib = safe_str(item.get("libraryId") or lib.get("id") or "")
                 title = safe_str(meta.get("title") or item.get("name") or item.get("id"))
                 number = safe_str(meta.get("number") or meta.get("numberSort") or "")
+                series_meta = series.get("metadata") if isinstance(series.get("metadata"), dict) else {}
+                series_title = safe_str(item.get("seriesTitle") or series_meta.get("title") or series.get("name") or "")
                 if library_id and item_lib and item_lib != library_id:
                     continue
                 if series_id and item_series and item_series != series_id:
@@ -502,6 +605,7 @@ class KomgaApi:
                         library_id=item_lib or safe_str(library_id or ""),
                         title=title,
                         number=number,
+                        series_title=series_title,
                         metadata=meta,
                         raw=item,
                     )
@@ -539,10 +643,92 @@ class KomgaApi:
         fallback_bodies = [body]
         legacy_body = {"libraryIds": [library_id] if library_id else [], "seriesIds": [series_id] if series_id else [], "search": search}
         fallback_bodies.append({k: v for k, v in legacy_body.items() if v})
-        fallback_bodies.append({"fullTextSearch": search} if search else {})
+        if not library_id and not series_id:
+            fallback_bodies.append({"fullTextSearch": search} if search else {})
 
         data_rows = self._list_with_fallback("/api/v1/books/list", fallback_bodies, "metadata.numberSort,asc", page_size)
         return to_items(data_rows)
+
+    def books_page(
+        self,
+        library_id: Optional[str] = None,
+        series_id: Optional[str] = None,
+        search: str = "",
+        *,
+        page: int = 0,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
+        """Return one Komga book page without loading the complete library."""
+        page = max(0, int(page))
+        page_size = min(200, max(1, int(page_size)))
+        conditions = []
+        if library_id:
+            conditions.append(_condition_for("libraryId", library_id))
+        if series_id:
+            conditions.append(_condition_for("seriesId", series_id))
+        body: Dict[str, Any] = {}
+        condition = _all_of(conditions)
+        if condition:
+            body["condition"] = condition
+        if search:
+            body["fullTextSearch"] = search
+        legacy = {
+            "libraryIds": [library_id] if library_id else [],
+            "seriesIds": [series_id] if series_id else [],
+            "search": search,
+        }
+        bodies = [body, {key: value for key, value in legacy.items() if value}]
+        if not library_id and not series_id:
+            bodies.append({"fullTextSearch": search} if search else {})
+        data = self._list_page_with_fallback(
+            "/api/v1/books/list",
+            bodies,
+            "metadata.numberSort,asc",
+            page,
+            page_size,
+        )
+        raw_rows = _page_items(data)
+        # Reuse the established Komga parsing and defensive client-side guards.
+        parsed = []
+        for item in raw_rows:
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            series = item.get("series") if isinstance(item.get("series"), dict) else {}
+            lib = item.get("library") if isinstance(item.get("library"), dict) else {}
+            item_series = safe_str(item.get("seriesId") or series.get("id") or "")
+            item_lib = safe_str(item.get("libraryId") or lib.get("id") or "")
+            title = safe_str(meta.get("title") or item.get("name") or item.get("id"))
+            number = safe_str(meta.get("number") or meta.get("numberSort") or "")
+            series_meta = series.get("metadata") if isinstance(series.get("metadata"), dict) else {}
+            series_title = safe_str(
+                item.get("seriesTitle")
+                or series_meta.get("title")
+                or series.get("name")
+                or ""
+            )
+            if library_id and item_lib and item_lib != library_id:
+                continue
+            if series_id and item_series and item_series != series_id:
+                continue
+            parsed.append(BookItem(
+                id=safe_str(item.get("id")),
+                series_id=item_series or safe_str(series_id or ""),
+                library_id=item_lib or safe_str(library_id or ""),
+                title=title,
+                number=number,
+                series_title=series_title,
+                metadata=meta,
+                raw=item,
+            ))
+        total = int(data.get("totalElements", len(parsed)) or 0)
+        total_pages = int(data.get("totalPages", 1 if total else 0) or 0)
+        return {
+            "items": parsed,
+            "page": int(data.get("number", page) or 0),
+            "size": int(data.get("size", page_size) or page_size),
+            "total": total,
+            "total_pages": total_pages,
+            "last": bool(data.get("last", page + 1 >= total_pages)),
+        }
 
     def get_series(self, series_id: str) -> Dict[str, Any]:
         return self.client.request_json("GET", f"/api/v1/series/{parse.quote(series_id, safe='')}")

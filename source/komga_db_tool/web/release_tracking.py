@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from ..manga_news import MangaNewsClient, series_slug_from_manga_news_url
 from ..mangabaka import MangaBakaClient
+from ..mangacollec import MangaCollecStore
+from ..bedetheque import normalize_volume_number
 from ..metadata_quality import (
     bedetheque_main_album_count,
     combine_release_tracking_risk,
@@ -133,9 +135,16 @@ def scan_next_releases(
     mangabaka: MangaBakaClient | None,
     progress: Callable[[int, int, str], None],
     cancelled: Callable[[], bool],
+    *,
+    mangacollec: MangaCollecStore | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     total = len(series_ids)
+    mangacollec_matches = (
+        mangacollec.next_releases_by_series(api.series(page_size=200))
+        if source == "mangacollec" and mangacollec is not None
+        else {}
+    )
     for index, series_id in enumerate(series_ids, start=1):
         if cancelled():
             break
@@ -158,7 +167,7 @@ def scan_next_releases(
             "action": "",
             "error": "",
         }
-        if not source_id and not url:
+        if source != "mangacollec" and not source_id and not url:
             row["action"] = "Ignoré : aucun lien source"
             rows.append(row)
             continue
@@ -173,21 +182,106 @@ def scan_next_releases(
                     raise RuntimeError("ID MangaBaka introuvable")
                 candidate = mangabaka.get_next_release(source_id)
                 row["raw"] = MangaBakaClient.next_release_candidate_to_dict(candidate)
+            elif source == "mangacollec":
+                if mangacollec is None:
+                    raise RuntimeError("Catalogue MangaCollec indisponible")
+                match = mangacollec_matches.get(series_id)
+                if not match:
+                    row["action"] = "Ignoré : aucune correspondance sûre"
+                    rows.append(row)
+                    continue
+                candidate = match["release"]
+                match_status = str(match.get("match_status") or "")
+                source_key = str(match.get("source_key") or "")
+                row["source_id"] = source_key
+                row["source_title"] = candidate.series
+                row["match_status"] = match_status
+                row["match_score"] = match.get("score", 0.0)
+                row["volume"] = candidate.volume
+                row["date"] = candidate.release_date
+                row["raw"] = {
+                    "series": candidate.series,
+                    "volume": candidate.volume,
+                    "release_date": candidate.release_date,
+                    "match_status": match_status,
+                }
+                if not is_current_or_future_release_date(candidate.release_date):
+                    row["action"] = "Ignoré : date passée ou invalide"
+                    rows.append(row)
+                    continue
+                row["new_tag"] = next_release_tag(candidate.volume, candidate.release_date)
+                wanted_number = normalize_volume_number(candidate.volume)
+                books = api.books(series_id=series_id, page_size=500)
+                existing = next(
+                    (
+                        book for book in books
+                        if wanted_number
+                        and normalize_volume_number(
+                            getattr(book, "number", "")
+                            or (getattr(book, "metadata", {}) or {}).get("number", "")
+                            or (getattr(book, "metadata", {}) or {}).get("numberSort", "")
+                        ) == wanted_number
+                    ),
+                    None,
+                )
+                row["volume_in_komga"] = existing is not None
+                row["existing_book_id"] = str(getattr(existing, "id", "") or "") if existing is not None else ""
+                if existing is not None:
+                    row["action"] = "Ignoré : tome déjà présent dans Komga"
+                    rows.append(row)
+                    continue
+                if row["new_tag"] == row["old_tag"]:
+                    row["action"] = "Déjà à jour"
+                else:
+                    row["action"] = "À appliquer"
+                    row["payload"] = next_release_payload(metadata, row["new_tag"])
+                rows.append(row)
+                continue
             else:
                 raise ValueError("Source prochaine sortie invalide")
             row["source_url"] = candidate.source_url or url
             row["volume"] = candidate.number
             row["date"] = candidate.release_date
-            row["new_tag"] = (
-                next_release_tag(candidate.number, candidate.release_date)
-                if is_current_or_future_release_date(candidate.release_date)
-                else ""
-            )
+            if candidate.release_date and not is_current_or_future_release_date(candidate.release_date):
+                row["action"] = "Ignoré : date passée ou invalide"
+                rows.append(row)
+                continue
+            if source == "manga_news" and candidate.release_date and not candidate.number:
+                row["action"] = "À vérifier : date seule, aucun numéro explicite"
+                row["error"] = (
+                    "Manga News indique une date de prochaine sortie sans annoncer de numéro de tome. "
+                    "Aucun tag nextrelease n'est proposé."
+                )
+                rows.append(row)
+                continue
+            row["new_tag"] = next_release_tag(candidate.number, candidate.release_date)
             if not row["new_tag"]:
                 row["action"] = "Aucune prochaine sortie"
-            elif row["new_tag"] == row["old_tag"]:
-                row["action"] = "Déjà à jour"
             else:
+                wanted_number = normalize_volume_number(candidate.number)
+                books = api.books(series_id=series_id, page_size=500)
+                existing = next(
+                    (
+                        book for book in books
+                        if wanted_number
+                        and normalize_volume_number(
+                            getattr(book, "number", "")
+                            or (getattr(book, "metadata", {}) or {}).get("number", "")
+                            or (getattr(book, "metadata", {}) or {}).get("numberSort", "")
+                        ) == wanted_number
+                    ),
+                    None,
+                )
+                row["volume_in_komga"] = existing is not None
+                row["existing_book_id"] = str(getattr(existing, "id", "") or "") if existing is not None else ""
+                if existing is not None:
+                    row["action"] = "Ignoré : tome déjà présent dans Komga"
+                    rows.append(row)
+                    continue
+                if row["new_tag"] == row["old_tag"]:
+                    row["action"] = "Déjà à jour"
+                    rows.append(row)
+                    continue
                 row["action"] = "À appliquer"
                 row["payload"] = next_release_payload(metadata, row["new_tag"])
         except Exception as exc:

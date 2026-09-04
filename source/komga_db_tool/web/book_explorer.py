@@ -14,8 +14,8 @@ from ..book_explorer import (
     filter_book_rows,
     sort_book_rows,
 )
-from ..manga_news import series_slug_from_manga_news_url
-from ..source_books import SourceBookRow, match_source_books
+from ..manga_news import manga_news_edition_label_from_url, series_slug_from_manga_news_url
+from ..source_books import SourceBookRow, match_source_books, resolved_book_volume_number
 
 
 def public_book_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +37,7 @@ def list_book_rows(
     source_filter: str = "all",
     missing_field: str = "",
     empty_summary: bool = False,
+    hide_chapter_series: bool = False,
     sort_field: str = "added_at",
     descending: bool = True,
 ) -> dict[str, Any]:
@@ -56,6 +57,7 @@ def list_book_rows(
         source_filter=source_filter,
         missing_field=missing_field,
         empty_summary=empty_summary,
+        hide_chapter_series=hide_chapter_series,
     )
     sorted_rows = sort_book_rows(filtered, sort_field, descending)
     return {
@@ -121,6 +123,7 @@ def _analyze_manga_news(
     client: Any,
 ) -> list[dict[str, Any]]:
     slug = series_slug_from_manga_news_url(source_url)
+    edition_label = manga_news_edition_label_from_url(source_url)
     if not slug:
         return [
             _analysis_row(
@@ -134,12 +137,25 @@ def _analyze_manga_news(
     results: list[dict[str, Any]] = []
     for row in rows:
         try:
-            candidate = client.get_volume_by_number(slug, row.get("number", ""))
-            exact = bool(
-                normalize_volume_number(row.get("number", ""))
-                and normalize_volume_number(row.get("number", ""))
-                == normalize_volume_number(candidate.number)
+            requested_number = resolved_book_volume_number(
+                row.get("number", ""),
+                row.get("title", ""),
+                row.get("series_title", ""),
             )
+            if requested_number:
+                candidate = client.get_volume_by_number(
+                    slug,
+                    requested_number,
+                    edition_label=edition_label,
+                )
+                exact = requested_number == normalize_volume_number(candidate.number)
+            else:
+                candidate = client.get_volume_without_number(
+                    slug,
+                    row.get("title", "") or row.get("series_title", ""),
+                    edition_label=edition_label,
+                )
+                exact = True
             results.append(
                 _analysis_row(
                     row,
@@ -169,73 +185,19 @@ def _analyze_bedetheque(
     source_url: str,
     client: Any,
 ) -> list[dict[str, Any]]:
-    try:
-        series_candidate = client.scrape_series(source_url)
-        albums = list((series_candidate.raw or {}).get("albums") or [])
-    except Exception as exc:
-        return [
-            _analysis_row(
-                row,
-                source="bedetheque",
-                source_ref=source_url,
-                status="Erreur de chargement Bedetheque",
-                error=str(exc),
-            )
-            for row in rows
-        ]
-    source_rows = [
-        SourceBookRow(
-            id=str(album.get("url") or index),
-            number=str(album.get("number") or ""),
-            title=str(album.get("title") or ""),
-            url=str(album.get("url") or ""),
-            raw=album,
+    return [
+        _analysis_row(
+            row,
+            source="bedetheque",
+            source_ref=source_url,
+            status="Métadonnées par tome indisponibles",
+            error=(
+                "Le CSV Bedetheque contient uniquement des données de série. "
+                "Aucune connexion au site ne sera effectuée."
+            ),
         )
-        for index, album in enumerate(albums)
+        for row in rows
     ]
-    matches = match_source_books([row.get("book") for row in rows], source_rows)[: len(rows)]
-    results: list[dict[str, Any]] = []
-    for row, match in zip(rows, matches):
-        source_index = int(match.get("source_index", -1))
-        if source_index < 0 or source_index >= len(source_rows):
-            results.append(
-                _analysis_row(
-                    row,
-                    source="bedetheque",
-                    source_ref=source_url,
-                    status="Aucun album correspondant",
-                )
-            )
-            continue
-        source_row = source_rows[source_index]
-        exact = str(match.get("confidence") or "").casefold().startswith("exact")
-        try:
-            candidate = client.scrape_album(source_row.url)
-            results.append(
-                _analysis_row(
-                    row,
-                    source="bedetheque",
-                    source_ref=candidate.source_url,
-                    matched_title=candidate.album_title or source_row.title,
-                    confidence="high" if exact else "ambiguous",
-                    score=float(match.get("score") or 0.0),
-                    candidate=candidate.book_metadata,
-                )
-            )
-        except Exception as exc:
-            results.append(
-                _analysis_row(
-                    row,
-                    source="bedetheque",
-                    source_ref=source_row.url,
-                    matched_title=source_row.title,
-                    confidence="high" if exact else "ambiguous",
-                    score=float(match.get("score") or 0.0),
-                    status="Erreur de chargement album",
-                    error=str(exc),
-                )
-            )
-    return results
 
 
 def _analyze_comicvine(
@@ -278,7 +240,11 @@ def _analyze_comicvine(
         )
         for issue in issues
     ]
-    matches = match_source_books([row.get("book") for row in rows], source_rows)[: len(rows)]
+    matches = match_source_books(
+        [row.get("book") for row in rows],
+        source_rows,
+        series_title=str(rows[0].get("series_title") or "") if rows else "",
+    )[: len(rows)]
     results: list[dict[str, Any]] = []
     for row, match in zip(rows, matches):
         source_index = int(match.get("source_index", -1))

@@ -173,6 +173,7 @@ def _results_list(payload: Any) -> List[Dict[str, Any]]:
 
 def _map_series_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
+    metadata["language"] = "en"
 
     title = _safe_str(data.get("name"))
     if title:
@@ -204,6 +205,7 @@ def _map_series_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _map_issue_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
+    metadata["language"] = "en"
 
     title = _safe_str(data.get("name"))
     if title:

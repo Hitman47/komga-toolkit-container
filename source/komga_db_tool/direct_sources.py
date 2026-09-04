@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 from urllib import parse, request
 
+from .metadata_cleanup import sanitize_incoming_series_metadata, title_script_language
+
 
 APP_USER_AGENT = "komga-toolkit/0.10.0 direct-metadata"
 MANGABAKA_BASE_URL = "https://api.mangabaka.dev"
@@ -105,15 +107,30 @@ def _string_list(value: Any) -> List[str]:
 def _alternate_titles(values: List[tuple[str, Any]], primary: str) -> List[Dict[str, str]]:
     output: List[Dict[str, str]] = []
     seen = {primary.casefold()} if primary else set()
+
+    def add(label: str, candidate: Any) -> None:
+        if isinstance(candidate, list):
+            for item in candidate:
+                add(label, item)
+            return
+        if isinstance(candidate, dict):
+            title_value = candidate.get("title") or candidate.get("name") or candidate.get("value")
+            if title_value not in (None, ""):
+                nested_label = _first_text(candidate.get("language"), candidate.get("lang"), candidate.get("locale"), label)
+                add(nested_label, title_value)
+            else:
+                for nested_label, nested_value in candidate.items():
+                    add(str(nested_label), nested_value)
+            return
+        title = _clean_text(candidate)
+        key = title.casefold()
+        if not title or key in seen:
+            return
+        seen.add(key)
+        output.append({"label": label, "title": title})
+
     for label, value in values:
-        candidates = value if isinstance(value, list) else [value]
-        for candidate in candidates:
-            title = _clean_text(candidate)
-            key = title.casefold()
-            if not title or key in seen:
-                continue
-            seen.add(key)
-            output.append({"label": label, "title": title})
+        add(label, value)
     return output
 
 
@@ -267,14 +284,15 @@ class MangaBakaClient:
 
         alternates = _alternate_titles(
             [
-                ("Titre original", data.get("native_title")),
-                ("Titre romanisé", data.get("romanized_title")),
-                ("Titre alternatif", data.get("secondary_titles")),
+                (title_script_language(data.get("native_title")) or language or "alt", data.get("native_title")),
+                (language or "alt", data.get("romanized_title")),
+                ("alt", data.get("secondary_titles")),
             ],
             title,
         )
         if alternates:
             metadata["alternateTitles"] = alternates
+        metadata = sanitize_incoming_series_metadata(metadata, primary_title=title)
         metadata["links"] = _links(data.get("links"), "MangaBaka", source_url)
 
         cover = _first_dict(data.get("cover"))
@@ -432,13 +450,14 @@ class MangaNewsClient:
 
         alternates = _alternate_titles(
             [
-                ("Titre original", data.get("title_vo")),
-                ("Titre traduit", data.get("translated_title")),
+                (title_script_language(data.get("title_vo")) or language or "alt", data.get("title_vo")),
+                ("fr", data.get("translated_title")),
             ],
             title,
         )
         if alternates:
             metadata["alternateTitles"] = alternates
+        metadata = sanitize_incoming_series_metadata(metadata, primary_title=title)
         metadata["links"] = _links([], "Manga-News", source_url)
 
         return DirectSeriesCandidate(

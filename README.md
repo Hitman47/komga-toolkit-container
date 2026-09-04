@@ -1,7 +1,7 @@
 # Komga Toolkit WebUI container
 
 Public container releases for the Komga Toolkit WebUI reference
-`desktop-v3.12.0rc3-20260723`.
+`desktop-v3.12.0rc24-20260831`.
 
 The image is intended for Docker Compose and Portainer deployments:
 
@@ -9,14 +9,14 @@ The image is intended for Docker Compose and Portainer deployments:
 ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
-La publication est reconstruite automatiquement depuis le snapshot strict du
-commit validé `e7f27d9a756d5f2c63ffafefd67b240cc92575ba`, conservé dans `source/`.
+La publication est reconstruite automatiquement depuis le snapshot rc24 validé
+par la suite complète de non-régression, conservé dans `source/`.
 Ce snapshot ne contient que le Dockerfile, les roues/dépendances Docker et le
 code applicatif nécessaire à l’image. Il ne contient ni configuration locale,
 ni identifiant, ni exécutable Desktop.
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.7.0-desktop-v2`, restent disponibles
+validée. Les tags versionnés, par exemple `2.24.0-desktop-v2`, restent disponibles
 pour revenir à une version antérieure.
 
 Les routes d'automatisation Bedetheque utilisent exclusivement le CSV persistant
@@ -27,6 +27,12 @@ deux séries Bedetheque. Le fichier reste dans le volume `/data` après
 rafraîchissement, reconnexion ou recréation du conteneur. Un nouvel upload
 valide le remplace atomiquement ; un fichier invalide ne détruit pas la copie
 existante.
+
+La version `2.24.0-desktop-v2` aligne la WebUI et l’image Docker sur Komga
+Toolkit Desktop `3.12.0rc24`. Elle embarque les écrans et correctifs de la rc24,
+ainsi que l’enrichissement **Metron** mono-série : jeton masqué, recherche,
+comparaison, prévisualisation et sauvegarde avant écriture. Les traitements
+Metron multiples et par tome restent volontairement exclus de cette étape.
 
 La version `2.7.0-desktop-v2` aligne Desktop et Web sur la validation
 d’enrichissement des tomes : titre et titre de tri décochés par défaut, sélection

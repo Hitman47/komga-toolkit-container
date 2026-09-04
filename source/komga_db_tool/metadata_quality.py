@@ -8,7 +8,7 @@ SEARCH_SEPARATOR_RE = re.compile(r"[!?:;\-_–—]+")
 SEARCH_QUOTES_RE = re.compile(r"[\"“”‘’`]+")
 SUMMARY_MIN_SIGNIFICANT_CHARS = 80
 CRITICAL_SERIES_UPDATE_FIELDS = {"status", "totalBookCount"}
-SUPPORTED_WRITE_LANGUAGES = {"fr", "en"}
+SUPPORTED_WRITE_LANGUAGES = {"fr", "en", "ja", "de", "es", "it", "pt", "nl"}
 CHAP_SCAN_EXCLUDED_SEGMENTS = {"chap", "scan"}
 
 LOW_VALUE_SUMMARY_PATTERNS = [
@@ -27,9 +27,9 @@ def compact_spaces(value: str) -> str:
 def normalize_write_language(value: Any) -> str:
     """Return a Komga language value only when it is allowed for writing.
 
-    User rule: automatic metadata updates may write only FR or EN. Any other
-    language code from external sources (ko, ja, es, etc.) must be ignored even
-    when Komga is blank.
+    Automatic metadata updates may write only the explicit, unambiguous BCP-47
+    languages used by the configured catalogues. Original-work languages such
+    as KO/ZH remain rejected unless a trusted edition source maps them.
     """
     text = scalar_metadata_text(value).strip().casefold().replace("_", "-")
     aliases = {
@@ -41,12 +41,35 @@ def normalize_write_language(value: Any) -> str:
         "eng": "en",
         "english": "en",
         "anglais": "en",
+        "jpn": "ja",
+        "japanese": "ja",
+        "japonais": "ja",
+        "deu": "de",
+        "ger": "de",
+        "german": "de",
+        "allemand": "de",
+        "spa": "es",
+        "spanish": "es",
+        "espagnol": "es",
+        "ita": "it",
+        "italian": "it",
+        "italien": "it",
+        "por": "pt",
+        "portuguese": "pt",
+        "portugais": "pt",
+        "dut": "nl",
+        "nld": "nl",
+        "dutch": "nl",
+        "neerlandais": "nl",
+        "néerlandais": "nl",
     }
     text = aliases.get(text, text)
     if text.startswith("fr-"):
         text = "fr"
     elif text.startswith("en-"):
         text = "en"
+    elif text.startswith("ja-"):
+        text = "ja"
     return text if text in SUPPORTED_WRITE_LANGUAGES else ""
 
 
@@ -158,6 +181,58 @@ def _space_search_apostrophes(value: Any) -> str:
     return compact_spaces(text)
 
 
+def _drop_leading_english_contraction(value: Any) -> str:
+    """Remove a blocking leading English contraction for fallback search only."""
+    text = clean_title_for_search(value)
+    apostrophe = r"['\u2018\u2019\u02bc`]"
+    negative = (
+        rf"(?:can(?:not|{apostrophe}t)|couldn{apostrophe}t|don{apostrophe}t|doesn{apostrophe}t|"
+        rf"didn{apostrophe}t|won{apostrophe}t|wouldn{apostrophe}t|shouldn{apostrophe}t|"
+        rf"isn{apostrophe}t|aren{apostrophe}t|wasn{apostrophe}t|weren{apostrophe}t|"
+        rf"haven{apostrophe}t|hasn{apostrophe}t|hadn{apostrophe}t|mustn{apostrophe}t)"
+    )
+    text = re.sub(
+        rf"^(?:i|you|we|they|he|she|it)\s+{negative}\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return compact_spaces(text)
+
+
+def _drop_leading_elision(value: Any) -> str:
+    """Remove a leading French elision (L', D'...) for fallback search only."""
+    text = clean_title_for_search(value)
+    return compact_spaces(
+        re.sub(r"^(?:l|d|j|t|m|n|s|c|qu)['\u2018\u2019\u02bc`]\s*", "", text, flags=re.IGNORECASE)
+    )
+
+
+def _compact_long_search_parts(value: Any) -> List[str]:
+    """Return short title fragments without inventing words.
+
+    Long catalogue titles often contain a short main-title segment followed by
+    a subtitle. For example, the useful fallback for
+    ``Moi, Quand ... En Slime - Comment ...`` is ``En Slime``. Separators are
+    read from the original value before generic punctuation cleanup.
+    """
+    raw = str(value or "")
+    segments = re.split(r"\s+(?:-|–|—)\s+|[,;:!?]+", raw)
+    result: List[str] = []
+    for segment in segments:
+        cleaned = clean_title_for_search(segment)
+        tokens = cleaned.split()
+        if len(tokens) < 2:
+            continue
+        compact = " ".join(tokens[-2:])
+        if compact and compact.casefold() not in {row.casefold() for row in result}:
+            result.append(compact)
+        final_word = tokens[-1]
+        if final_word and final_word.casefold() not in {row.casefold() for row in result}:
+            result.append(final_word)
+    return result
+
+
 def _drop_low_value_search_words(value: Any) -> str:
     text = str(value or "")
     # Words that often block Bedetheque/MangaBaka searches but rarely identify
@@ -196,18 +271,25 @@ def build_search_queries(value: Any, *, max_queries: int = 10) -> List[str]:
 
     primary = clean_title_for_search(value)
     no_parens = _drop_parenthetical_search_parts(value)
+    compact_parts = _compact_long_search_parts(value)
 
-    for candidate in (
+    ordered_candidates = [
         primary,
+        _drop_leading_english_contraction(primary),
+        _drop_leading_elision(primary),
+        no_parens,
+        _drop_leading_english_contraction(no_parens),
+        _drop_leading_elision(no_parens),
+        *compact_parts,
         _drop_search_apostrophes(primary),
         _space_search_apostrophes(primary),
-        no_parens,
         _drop_search_apostrophes(no_parens),
         _space_search_apostrophes(no_parens),
         _drop_edition_search_words(no_parens),
         _drop_low_value_search_words(_space_search_apostrophes(_drop_edition_search_words(no_parens))),
         _drop_low_value_search_words(_drop_search_apostrophes(_drop_edition_search_words(no_parens))),
-    ):
+    ]
+    for candidate in ordered_candidates:
         add(candidate)
 
     # Last-resort broad query: the first meaningful token. This handles cases
@@ -218,6 +300,33 @@ def build_search_queries(value: Any, *, max_queries: int = 10) -> List[str]:
         add(tokens[0])
 
     return variants[:max_queries]
+
+
+def build_conservative_search_queries(value: Any, *, max_queries: int = 2) -> List[str]:
+    """Return safe fallback variants for slower external search engines.
+
+    The primary query is always kept. Fallbacks must retain at least two
+    meaningful words so a failed apostrophe search does not turn into a broad,
+    slow one-word scrape.
+    """
+    all_queries = build_search_queries(value, max_queries=20)
+    if not all_queries:
+        return []
+    selected = [all_queries[0]]
+    allowed_single_words = {
+        query.casefold()
+        for query in _compact_long_search_parts(value)
+        if len(query.split()) == 1
+    }
+    for query in all_queries[1:]:
+        meaningful = [token for token in query.split() if len(token.strip("'")) >= 2]
+        if len(meaningful) < 2 and query.casefold() not in allowed_single_words:
+            continue
+        if query.casefold() not in {row.casefold() for row in selected}:
+            selected.append(query)
+        if len(selected) >= max(1, int(max_queries or 1)):
+            break
+    return selected[: max(1, int(max_queries or 1))]
 
 
 def clean_title_for_compare(value: Any) -> str:

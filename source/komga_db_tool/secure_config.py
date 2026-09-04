@@ -13,6 +13,7 @@ SECRET_FIELDS = {
     "username": "komga.username",
     "password": "komga.password",
     "comicvine_api_key": "comicvine.api_key",
+    "metron_token": "metron.token",
 }
 SECRET_SPECS = (
     ("komga", "api_key", "komga.api_key"),
@@ -20,6 +21,7 @@ SECRET_SPECS = (
     ("komga", "password", "komga.password"),
     ("manga_news", "token", "manga_news.token"),
     ("comicvine", "api_key", "comicvine.api_key"),
+    ("metron", "token", "metron.token"),
 )
 
 

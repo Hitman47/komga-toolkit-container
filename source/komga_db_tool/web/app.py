@@ -22,14 +22,40 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..runtime import SecretRedactor
 from ..csv_tools import DIRECTOR_COLUMNS, SPECIALIZED_COLUMNS, book_inventory_row, parse_director_actions, read_csv
-from ..metadata_quality import is_blank_metadata_value, is_low_value_summary
+from ..metadata_quality import build_conservative_search_queries, build_search_queries, clean_title_for_search, is_blank_metadata_value, is_low_value_summary
+from ..metadata_cleanup import (
+    analyze_alternate_titles,
+    analyze_series_entity_alternate_titles,
+    scan_series_alternate_titles,
+)
 from ..kora.constants import KORA_GENRE_LABELS, KORA_GENRES, MAX_KORA_GENRES
 from ..kora.tag_logic import extract_kora_genres, merge_series_tags_for_genres, validate_genres
 from ..kora.local_exclusions import LocalExclusionsStore
 from ..kora.cache import CacheStore
 from ..kora.models import PendingChange
-from ..bedetheque import match_album_rows
+from ..kora.suggestions import suggest_series_genres
+from ..bedetheque import match_album_rows, title_similarity
+from ..manga_news import split_manga_news_edition_title
+from ..mangabaka import (
+    MANGABAKA_AUTOMATCH_MIN_MARGIN,
+    conservative_mangabaka_payload,
+    mangabaka_match_score,
+    mangabaka_search_title,
+    ranked_mangabaka_choices,
+    select_mangabaka_automatch,
+)
+from ..nautiljon import clean_nautiljon_query, select_nautiljon_automatch
 from ..enrichment_history import EnrichmentHistoryStore, format_search_timestamp
+from ..cover_search import DuckDuckGoCoverSearchClient, download_cover_image
+from ..chapter_cleanup import analyze_chapter_series_item, scan_chapter_series
+from ..author_cleanup import (
+    analyze_book_author_change,
+    author_decision_is_remembered,
+    author_mapping_for_group,
+    load_cached_author_references,
+    scan_author_groups,
+)
+from ..language_cleanup import normalize_language as normalize_cleanup_language, scan_language_cleanup
 from .jobs import jobs
 from .analysis import collection_path_suggestions
 from .book_explorer import analyze_book_rows, list_book_rows
@@ -65,8 +91,9 @@ class SourceSettingsRequest(BaseModel):
     mangabaka_url: str | None = Field(default=None, max_length=2048)
     comicvine_url: str | None = Field(default=None, max_length=2048)
     comicvine_api_key: str | None = Field(default=None, max_length=4096)
+    metron_url: str | None = Field(default=None, max_length=2048)
+    metron_token: str | None = Field(default=None, max_length=4096)
     timeout: int | None = Field(default=None, ge=3, le=300)
-    bedetheque_csv_only: bool | None = None
 
 
 class MetadataPreviewRequest(BaseModel):
@@ -93,7 +120,7 @@ class EnrichmentHistoryRequest(BaseModel):
 
 
 class NextReleaseScanRequest(BaseModel):
-    source: Literal["manga_news", "mangabaka"]
+    source: Literal["manga_news", "mangabaka", "mangacollec"]
     series_ids: list[str] = Field(min_length=1, max_length=5000)
 
 
@@ -143,9 +170,77 @@ class PosterUrlRequest(BaseModel):
     confirmed: bool = False
 
 
+class PosterSearchApplyRequest(PosterUrlRequest):
+    thumbnail_url: HttpUrl | None = None
+    source_url: HttpUrl | None = None
+
+
+class CoverImageSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=30, ge=1, le=60)
+
+
 class AuditRequest(BaseModel):
     library_id: str = Field(min_length=1, max_length=256)
     include_books: bool = True
+
+
+class AlternateTitleCleanupScanRequest(BaseModel):
+    library_id: str = Field(min_length=1, max_length=256)
+    added_days: int = Field(default=0, ge=0, le=36500)
+
+
+class AlternateTitleCleanupChangeRequest(BaseModel):
+    series_id: str = Field(min_length=1, max_length=256)
+    overrides: dict[int, Literal["keep", "keep_fr", "keep_en", "keep_ja", "remove"]] = Field(default_factory=dict)
+
+
+class AlternateTitleCleanupPreviewRequest(BaseModel):
+    changes: list[AlternateTitleCleanupChangeRequest] = Field(min_length=1, max_length=5000)
+
+
+class ChapterSeriesCleanupScanRequest(BaseModel):
+    library_id: str = Field(min_length=1, max_length=256)
+
+
+class ChapterSeriesCleanupChangeRequest(BaseModel):
+    series_id: str = Field(min_length=1, max_length=256)
+    expected_path: str = Field(min_length=1, max_length=4096)
+    expected_title: str = Field(min_length=1, max_length=1000)
+
+
+class ChapterSeriesCleanupPreviewRequest(BaseModel):
+    changes: list[ChapterSeriesCleanupChangeRequest] = Field(min_length=1, max_length=5000)
+
+
+class AuthorCleanupScanRequest(BaseModel):
+    library_id: str = Field(min_length=1, max_length=256)
+
+
+class AuthorCleanupChangeRequest(BaseModel):
+    group_id: str = Field(min_length=1, max_length=64)
+    canonical: str = Field(min_length=1, max_length=1000)
+    replacement_names: list[str] = Field(default_factory=list, max_length=20)
+
+
+class AuthorCleanupPreviewRequest(BaseModel):
+    library_id: str = Field(min_length=1, max_length=256)
+    changes: list[AuthorCleanupChangeRequest] = Field(min_length=1, max_length=5000)
+
+
+class LanguageCleanupScanRequest(BaseModel):
+    library_id: str = Field(min_length=1, max_length=256)
+    scope: Literal["series", "books", "both"] = "series"
+
+
+class LanguageCleanupChangeRequest(BaseModel):
+    target_type: Literal["series", "book"]
+    target_id: str = Field(min_length=1, max_length=256)
+    proposed_language: str = Field(min_length=2, max_length=35)
+
+
+class LanguageCleanupPreviewRequest(BaseModel):
+    changes: list[LanguageCleanupChangeRequest] = Field(min_length=1, max_length=10000)
 
 
 class BulkMembershipRequest(BaseModel):
@@ -175,6 +270,27 @@ class TomeMatchRequest(BaseModel):
     albums: list[dict[str, str]] = Field(max_length=5000)
 
 
+class MangaBakaAutomatchPreviewRequest(BaseModel):
+    series_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class MangaBakaAutomatchManualPreviewRequest(BaseModel):
+    series_id: str = Field(min_length=1, max_length=256)
+    source_id: str = Field(min_length=1, max_length=256)
+
+
+class MangaBakaAutomatchApplyRequest(BaseModel):
+    tokens: list[str] = Field(min_length=1, max_length=500)
+
+
+class NautiljonAutomatchPreviewRequest(BaseModel):
+    series_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class NautiljonAutomatchApplyRequest(BaseModel):
+    tokens: list[str] = Field(min_length=1, max_length=500)
+
+
 class BookExplorerAnalyzeRequest(BaseModel):
     library_id: str = Field(min_length=1, max_length=256)
     book_ids: list[str] = Field(min_length=1, max_length=5000)
@@ -202,6 +318,24 @@ class KoraPendingRequest(BaseModel):
     title: str = Field(default="", max_length=1000)
     genres: list[str] = Field(max_length=MAX_KORA_GENRES)
     note: str = Field(default="", max_length=2000)
+
+
+class KoraSuggestionRequest(BaseModel):
+    series_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class KoraSuggestionChangeRequest(BaseModel):
+    series_id: str = Field(min_length=1, max_length=256)
+    genres: list[str] = Field(max_length=MAX_KORA_GENRES)
+
+
+class KoraSuggestionPreviewRequest(BaseModel):
+    changes: list[KoraSuggestionChangeRequest] = Field(min_length=1, max_length=1000)
+
+
+class MangaCollecMappingRequest(BaseModel):
+    source_title: str = Field(min_length=1, max_length=1000)
+    series_id: str = Field(min_length=1, max_length=256)
 
 
 class SeriesFixRequest(BaseModel):
@@ -236,6 +370,17 @@ app.add_middleware(
         if host.strip()
     ],
 )
+
+
+def _cached_author_references() -> dict[str, dict[str, Any]]:
+    cache_root = WEB_DATA_DIR / "cache"
+    return load_cached_author_references(
+        {
+            "mangabaka": cache_root / "mangabaka",
+            "manga_news": cache_root / "manga_news",
+        },
+        index_path=WEB_DATA_DIR / "author_reference_index.json",
+    )
 
 
 def api_or_401():
@@ -332,7 +477,7 @@ def source_settings() -> dict:
 def update_source_settings(payload: SourceSettingsRequest) -> dict:
     try:
         values = payload.model_dump(exclude_none=True)
-        for key in ("manga_news_url", "mangabaka_url", "comicvine_url"):
+        for key in ("manga_news_url", "mangabaka_url", "comicvine_url", "metron_url"):
             value = values.get(key)
             if value and ("@" in value.split("//", 1)[-1].split("/", 1)[0]):
                 raise ValueError(f"{key} ne doit contenir aucun identifiant")
@@ -387,6 +532,76 @@ async def upload_bedetheque_csv(request: Request) -> dict:
         raise HTTPException(status_code=413, detail="CSV Bedetheque vide ou supérieur à 100 Mio")
     try:
         return session_store.persist_bedetheque_csv(data)
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/sources/nautiljon/csv")
+async def upload_nautiljon_csv(request: Request) -> dict:
+    data = await request.body()
+    if not data or len(data) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV Nautiljon vide ou supérieur à 100 Mio")
+    try:
+        return session_store.persist_nautiljon_csv(data)
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/sources/mangacollec/catalog")
+async def upload_mangacollec_catalog(
+    request: Request,
+    filename: str = Query(default="mangacollec.csv", max_length=500),
+) -> dict:
+    data = await request.body()
+    if not data or len(data) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Fichier MangaCollec vide ou supérieur à 100 Mio")
+    try:
+        return session_store.mangacollec_store().import_bytes(data, filename)
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.get("/api/sources/mangacollec/catalog")
+def mangacollec_catalog_status() -> dict:
+    return session_store.mangacollec_store().status()
+
+
+@app.get("/api/sources/mangacollec/matches")
+def mangacollec_matches(
+    library_id: str = Query(default="", max_length=256),
+) -> list[dict[str, Any]]:
+    try:
+        rows = api_or_401().series(library_id=library_id or None, page_size=200)
+        return session_store.mangacollec_store().match_rows(rows)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.put("/api/sources/mangacollec/mappings")
+def save_mangacollec_mapping(payload: MangaCollecMappingRequest) -> dict:
+    try:
+        entity = api_or_401().get_series(payload.series_id)
+        metadata = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+        title = str(metadata.get("title") or entity.get("name") or payload.series_id)
+        return session_store.mangacollec_store().save_mapping(
+            payload.source_title,
+            payload.series_id,
+            title,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.delete("/api/sources/mangacollec/mappings")
+def delete_mangacollec_mapping(
+    source_title: str = Query(min_length=1, max_length=1000),
+) -> dict:
+    try:
+        return {"removed": session_store.mangacollec_store().delete_mapping(source_title)}
     except Exception as exc:
         raise domain_error(exc) from exc
 
@@ -447,6 +662,30 @@ def series(
         raise safe_error(exc) from exc
 
 
+@app.get("/api/series-page")
+def series_page(
+    library_id: str = Query(default="", max_length=256),
+    search: str = Query(default="", max_length=500),
+    page: int = Query(default=0, ge=0),
+    size: int = Query(default=40, ge=1, le=200),
+) -> dict:
+    try:
+        result = api_or_401().series_page(
+            library_id=library_id or None,
+            search=search,
+            page=page,
+            page_size=size,
+        )
+        return {
+            **result,
+            "items": [public_dataclass(row) for row in result.get("items") or []],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
 @app.get("/api/series/{series_id}")
 def series_detail(series_id: str) -> dict:
     try:
@@ -474,6 +713,49 @@ def books(series_id: str, library_id: str = Query(default="", max_length=256)) -
         raise safe_error(exc) from exc
 
 
+@app.get("/api/books")
+def search_books(
+    library_id: str = Query(default="", max_length=256),
+    search: str = Query(default="", max_length=500),
+    series_id: str = Query(default="", max_length=256),
+    page: int = Query(default=0, ge=0),
+    size: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    """Search one progressive book page and expose its parent series title."""
+    try:
+        api = api_or_401()
+        result = api.books_page(
+            library_id=library_id or None,
+            series_id=series_id or None,
+            search=search,
+            page=page,
+            page_size=size,
+        )
+        items = list(result.get("items") or [])
+        missing_series_ids = {
+            str(row.series_id or "")
+            for row in items
+            if row.series_id and not row.series_title
+        }
+        if missing_series_ids:
+            titles = {
+                str(row.id): str(row.title or "")
+                for row in api.series(library_id=library_id or None)
+                if str(row.id) in missing_series_ids
+            }
+            for row in items:
+                if not row.series_title:
+                    row.series_title = titles.get(str(row.series_id), "")
+        return {
+            **{key: value for key, value in result.items() if key != "items"},
+            "items": [public_dataclass(row) for row in items],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
 @app.get("/api/books/{book_id}")
 def book_detail(book_id: str) -> dict:
     try:
@@ -494,6 +776,7 @@ def book_explorer(
     source_filter: str = Query(default="all", max_length=100),
     missing_field: str = Query(default="", max_length=100),
     empty_summary: bool = Query(default=False),
+    hide_chapters: bool = Query(default=False),
     sort_field: Literal["added_at", "series_title", "title", "number", "release_date"] = "added_at",
     descending: bool = Query(default=True),
 ) -> dict[str, Any]:
@@ -513,6 +796,7 @@ def book_explorer(
             source_filter=source_filter,
             missing_field=missing_field,
             empty_summary=empty_summary,
+            hide_chapter_series=hide_chapters,
             sort_field=sort_field,
             descending=descending,
         )
@@ -565,7 +849,7 @@ def preview_metadata(payload: MetadataPreviewRequest) -> dict:
 @app.post("/api/metadata/apply")
 def apply_metadata(payload: TokenRequest) -> dict:
     try:
-        return operations.apply_metadata(api_or_401(), payload.token)
+        return operations.apply_any(api_or_401(), payload.token)
     except HTTPException:
         raise
     except Exception as exc:
@@ -769,12 +1053,15 @@ def readlist_completeness(
 
 
 @app.get("/api/sources/{source}/test")
-def test_source(source: Literal["manga_news", "mangabaka", "comicvine"]) -> dict:
+def test_source(source: Literal["bedetheque", "nautiljon", "manga_news", "mangabaka", "comicvine", "metron"]) -> dict:
     try:
         client = {
+            "bedetheque": session_store.bedetheque_client,
+            "nautiljon": session_store.nautiljon_client,
             "manga_news": session_store.manga_news_client,
             "mangabaka": session_store.mangabaka_client,
             "comicvine": session_store.comicvine_client,
+            "metron": session_store.metron_client,
         }[source]()
         return {"source": source, "message": client.test()}
     except Exception as exc:
@@ -783,53 +1070,95 @@ def test_source(source: Literal["manga_news", "mangabaka", "comicvine"]) -> dict
 
 @app.get("/api/sources/{source}/search")
 def search_source(
-    source: Literal["bedetheque", "manga_news", "mangabaka", "comicvine"],
+    source: Literal["bedetheque", "nautiljon", "manga_news", "mangabaka", "comicvine", "metron"],
     q: str = Query(min_length=1, max_length=500),
     limit: int = Query(default=20, ge=1, le=100),
     series_id: str = Query(default="", max_length=256),
     series_title: str = Query(default="", max_length=1000),
+    editions: bool = Query(default=False),
 ) -> list[dict]:
     try:
-        if source == "bedetheque":
-            rows = session_store.bedetheque_client().search(q)
-        elif source == "manga_news":
-            rows = session_store.manga_news_client().search(q, limit=limit)
-        elif source == "mangabaka":
-            rows = session_store.mangabaka_client().search(q, limit=limit)
+        if source == "mangabaka":
+            q = mangabaka_search_title(q)
+        _, edition_hint = split_manga_news_edition_title(q) if source == "manga_news" else (q, "")
+        edition_mode = bool(source == "manga_news" and (editions or edition_hint))
+        used_query = q
+        if edition_mode:
+            rows = session_store.manga_news_client().search_editions(q, limit=limit)
         else:
-            rows = session_store.comicvine_client().search(q, limit=limit)
+            queries = (
+                build_conservative_search_queries(q, max_queries=3)
+                if source in {"manga_news", "comicvine", "metron"}
+                else build_search_queries(q)
+            )
+            rows = []
+            for candidate_query in queries or [q]:
+                used_query = candidate_query
+                if source == "bedetheque":
+                    rows = session_store.bedetheque_client().search(candidate_query)
+                elif source == "nautiljon":
+                    rows = session_store.nautiljon_client().search(candidate_query, limit=limit)
+                elif source == "manga_news":
+                    rows = session_store.manga_news_client().search(candidate_query, limit=limit)
+                elif source == "mangabaka":
+                    rows = session_store.mangabaka_client().search(candidate_query, limit=limit)
+                elif source == "metron":
+                    rows = session_store.metron_client().search(candidate_query, limit=limit)
+                else:
+                    rows = session_store.comicvine_client().search(candidate_query, limit=limit)
+                if rows:
+                    break
         if series_id:
             ENRICHMENT_HISTORY.record_search(source, series_id, series_title or q)
-        return [public_candidate(row) for row in rows]
+        public_rows = [public_candidate(row) for row in rows]
+        if not edition_mode and source != "nautiljon":
+            for row in public_rows:
+                row["match_score"] = round(
+                    title_similarity(
+                        clean_title_for_search(q),
+                        clean_title_for_search(row.get("title") or ""),
+                    ),
+                    3,
+                )
+                row["search_query_used"] = used_query
+            public_rows.sort(
+                key=lambda row: (
+                    -float(row.get("match_score") or 0.0),
+                    str(row.get("title") or "").casefold(),
+                    str(row.get("slug") or row.get("id") or row.get("url") or ""),
+                )
+            )
+        return public_rows
     except Exception as exc:
         raise safe_error(exc) from exc
 
 
 @app.get("/api/sources/{source}/candidate")
 def source_candidate(
-    source: Literal["bedetheque", "manga_news", "mangabaka", "comicvine"],
+    source: Literal["bedetheque", "nautiljon", "manga_news", "mangabaka", "comicvine", "metron"],
     source_id: str = Query(default="", max_length=1000),
     url: str = Query(default="", max_length=3000),
+    edition_label: str = Query(default="", max_length=200),
+    series_title: str = Query(default="", max_length=1000),
 ) -> dict:
     try:
         if source == "bedetheque":
             candidate = session_store.bedetheque_client().scrape_series(url or source_id)
+        elif source == "nautiljon":
+            candidate = session_store.nautiljon_client().get_series(url or source_id)
         elif source == "manga_news":
             client = session_store.manga_news_client()
-            candidate = client.get_series_by_url(url) if url else client.get_series(source_id)
+            if edition_label:
+                candidate = client.get_series_edition(source_id, edition_label, target_title=series_title)
+            else:
+                candidate = client.get_series_by_url(url) if url else client.get_series(source_id)
         elif source == "mangabaka":
             candidate = session_store.mangabaka_client().get_series(source_id)
+        elif source == "metron":
+            candidate = session_store.metron_client().get_series(source_id)
         else:
             candidate = session_store.comicvine_client().get_volume(source_id)
         return public_candidate(candidate)
-    except Exception as exc:
-        raise safe_error(exc) from exc
-
-
-@app.get("/api/sources/bedetheque/album")
-def bedetheque_album(url: str = Query(min_length=1, max_length=3000)) -> dict:
-    try:
-        return public_candidate(session_store.bedetheque_client().scrape_album(url))
     except Exception as exc:
         raise safe_error(exc) from exc
 
@@ -861,10 +1190,11 @@ def manga_news_volume(
     series_slug: str = Query(default="", max_length=500),
     number: str = Query(default="", max_length=100),
     url: str = Query(default="", max_length=3000),
+    edition_label: str = Query(default="", max_length=200),
 ) -> dict:
     try:
         client = session_store.manga_news_client()
-        candidate = client.get_volume_by_url(url) if url else client.get_volume_by_number(series_slug, number)
+        candidate = client.get_volume_by_url(url) if url else client.get_volume_by_number(series_slug, number, edition_label=edition_label)
         return public_candidate(candidate)
     except Exception as exc:
         raise safe_error(exc) from exc
@@ -902,6 +1232,11 @@ def start_next_release_scan(payload: NextReleaseScanRequest) -> dict:
             mangabaka,
             progress,
             cancelled,
+            mangacollec=(
+                session_store.mangacollec_store()
+                if payload.source == "mangacollec"
+                else None
+            ),
         )
 
     return jobs.submit(f"Prochaines sorties {payload.source}", action).public()
@@ -992,11 +1327,7 @@ def start_guided_release_tracking_apply(payload: ReleaseTrackingGuidedApplyReque
 
 def _release_tracking_client(source: str, *, automation: bool = False) -> Any:
     factories = {
-        "bedetheque": (
-            session_store.bedetheque_automation_client
-            if automation
-            else session_store.bedetheque_client
-        ),
+        "bedetheque": session_store.bedetheque_client,
         "manga_news": session_store.manga_news_client,
         "mangabaka": session_store.mangabaka_client,
         "comicvine": session_store.comicvine_client,
@@ -1546,6 +1877,93 @@ def kora_pending() -> list[dict]:
     ]
 
 
+@app.post("/api/kora/suggestions")
+def kora_suggestions(payload: KoraSuggestionRequest) -> dict:
+    pending = KORA_CACHE.pending_genres_by_series_id()
+    rows: list[dict[str, object]] = []
+    missing_ids: list[str] = []
+    seen: set[str] = set()
+    for series_id in payload.series_ids:
+        if series_id in seen:
+            continue
+        seen.add(series_id)
+        record = KORA_CACHE.get_series(series_id)
+        if record is None:
+            missing_ids.append(series_id)
+            continue
+        suggestion = suggest_series_genres(
+            record,
+            current_genres=pending.get(record.id, record.kora_genres),
+            has_pending=record.id in pending,
+        )
+        rows.append(suggestion.public())
+    return {
+        "rows": rows,
+        "missing_ids": missing_ids,
+        "max_genres": MAX_KORA_GENRES,
+        "source_priority": ["genres_komga", "tags_komga"],
+    }
+
+
+@app.post("/api/kora/suggestions/preview")
+def preview_kora_suggestions(payload: KoraSuggestionPreviewRequest) -> dict:
+    try:
+        api = api_or_401()
+        tokens: list[str] = []
+        rows: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for change in payload.changes:
+            if change.series_id in seen:
+                continue
+            seen.add(change.series_id)
+            genres = validate_genres(change.genres)
+            entity = api.get_series(change.series_id)
+            metadata = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+            current_tags = metadata.get("tags") if isinstance(metadata.get("tags"), list) else []
+            current_genres = extract_kora_genres(current_tags)
+            if current_genres == genres:
+                continue
+            preview = operations.preview_metadata(
+                api,
+                "series",
+                change.series_id,
+                {"tags": merge_series_tags_for_genres(current_tags, genres)},
+                "kora_genre_suggestion",
+            )
+            tokens.append(preview["token"])
+            rows.append(
+                {
+                    "series_id": change.series_id,
+                    "current_genres": current_genres,
+                    "proposed_genres": genres,
+                    "token": preview["token"],
+                }
+            )
+        return {"tokens": tokens, "rows": rows, "count": len(tokens)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/kora/suggestions/apply")
+def apply_kora_suggestions(payload: TokenListRequest) -> dict:
+    try:
+        api = api_or_401()
+        applied: list[str] = []
+        for token in payload.tokens:
+            result = operations.apply_any(api, token)
+            target_id = str(result.get("target_id") or "")
+            if target_id:
+                applied.append(target_id)
+        KORA_CACHE.remove_pending(applied)
+        return {"applied": len(applied), "series_ids": applied}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
 @app.post("/api/kora/pending")
 def add_kora_pending(payload: KoraPendingRequest) -> dict:
     try:
@@ -1774,6 +2192,338 @@ def _require_public_http_url(value: str) -> None:
         raise ValueError("Les adresses locales, privées ou réservées sont refusées")
 
 
+def _upload_remote_poster(
+    target_type: str,
+    target_id: str,
+    url: str,
+    *,
+    select_after_upload: bool = False,
+    thumbnail_url: str = "",
+    source_url: str = "",
+) -> dict:
+    temp_path = ""
+    api = api_or_401()
+    before = api.list_thumbnails(target_type, target_id)
+    before_ids = {str(row.get("id") or "") for row in before}
+    try:
+        downloaded = download_cover_image(
+            url,
+            thumbnail_url=thumbnail_url,
+            source_url=source_url,
+            timeout=60,
+            validate_url=_require_public_http_url,
+        )
+        suffix_by_type = {"image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+        suffix = Path(urlparse(downloaded.final_url).path).suffix.lower() or suffix_by_type.get(downloaded.content_type, ".jpg")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            handle.write(downloaded.data)
+            temp_path = handle.name
+        operations.backup.save_json(
+            "operation", target_type, target_id,
+            {
+                "thumbnails": before,
+                "poster_upload_url": downloaded.final_url,
+                "select_after_upload": select_after_upload,
+                "used_thumbnail_fallback": downloaded.used_fallback,
+            },
+            "WebUI avant upload poster URL",
+        )
+        response = api.add_thumbnail(target_type, target_id, temp_path)
+        selected_id = ""
+        if select_after_upload:
+            after = api.list_thumbnails(target_type, target_id)
+            response_id = str(response.get("id") or response.get("thumbnailId") or "") if isinstance(response, dict) else ""
+            new_ids = [str(row.get("id") or "") for row in after if str(row.get("id") or "") not in before_ids]
+            selected_id = response_id or (new_ids[-1] if new_ids else "")
+            if not selected_id:
+                raise RuntimeError("Image ajoutée, mais son identifiant Komga n'a pas pu être déterminé")
+            api.select_thumbnail(target_type, target_id, selected_id)
+        return {
+            "status": "uploaded_and_selected" if selected_id else "uploaded",
+            "thumbnail_id": selected_id,
+            "response": response,
+        }
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+@app.post("/api/posters/search")
+def search_cover_images(payload: CoverImageSearchRequest) -> dict:
+    try:
+        api_or_401()
+        rows = DuckDuckGoCoverSearchClient(timeout=30).search(payload.query, payload.limit)
+        return {"query": payload.query, "provider": "duckduckgo_images", "rows": [row.public() for row in rows]}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
+@app.post("/api/sources/mangabaka/automatch/preview")
+def preview_mangabaka_automatch(payload: MangaBakaAutomatchPreviewRequest) -> dict:
+    try:
+        api = api_or_401()
+        client = session_store.mangabaka_client()
+        rows: list[dict[str, Any]] = []
+        for index, series_id in enumerate(dict.fromkeys(payload.series_ids), start=1):
+            row: dict[str, Any] = {
+                "index": index,
+                "series_id": series_id,
+                "komga_title": "",
+                "query": "",
+                "matched_title": "",
+                "match_score": 0.0,
+                "second_score": 0.0,
+                "status": "",
+                "payload_fields": "",
+                "token": "",
+                "eligible": False,
+                "choices": [],
+                "error": "",
+            }
+            try:
+                entity = api.get_series(series_id)
+                current = dict(entity.get("metadata") or {})
+                books_metadata = entity.get("booksMetadata") if isinstance(entity.get("booksMetadata"), dict) else {}
+                if books_metadata.get("authors"):
+                    current["authors"] = books_metadata["authors"]
+                title = str(current.get("title") or entity.get("name") or series_id)
+                query = mangabaka_search_title(title)
+                row["komga_title"] = title
+                row["query"] = query
+                ENRICHMENT_HISTORY.record_search("mangabaka", series_id, title)
+                results = []
+                used_query = query
+                for candidate_query in build_search_queries(query):
+                    used_query = candidate_query
+                    results = client.search(candidate_query, limit=50)
+                    if results:
+                        break
+                row["search_query_used"] = used_query
+                row["choices"] = [
+                    {
+                        "id": choice.id,
+                        "title": choice.title,
+                        "type": choice.type,
+                        "source_url": choice.source_url,
+                        "match_score": round(choice_score, 6),
+                    }
+                    for choice, choice_score in ranked_mangabaka_choices(query, results, limit=5)
+                ]
+                matched, status, best, second, count = select_mangabaka_automatch(
+                    query,
+                    results,
+                    min_score=0.90,
+                    min_margin=MANGABAKA_AUTOMATCH_MIN_MARGIN,
+                )
+                row.update({"status": status, "match_score": round(best, 3), "second_score": round(second, 3), "result_count": count})
+                if matched is None:
+                    rows.append(row)
+                    continue
+                candidate = client.get_series(matched.id)
+                loaded_score = mangabaka_match_score(query, candidate)
+                row.update({
+                    "matched_id": matched.id,
+                    "matched_title": matched.title,
+                    "loaded_title": candidate.title,
+                    "loaded_score": round(loaded_score, 3),
+                })
+                if max(best, loaded_score) < 0.90:
+                    row["status"] = "Échec : score insuffisant après chargement"
+                    rows.append(row)
+                    continue
+                source_metadata = dict(candidate.series_metadata or {})
+                proposed = conservative_mangabaka_payload(current, source_metadata)
+                row["payload_fields"] = "; ".join(proposed.keys())
+                if not proposed:
+                    row["status"] = "OK : aucun changement"
+                    rows.append(row)
+                    continue
+                preview = operations.preview_metadata(api, "series", series_id, proposed, "auto_match_mangabaka_webui")
+                row.update({"status": "Prêt", "token": preview["token"], "eligible": True, "diff": preview["diff"]})
+            except Exception as exc:
+                row["status"] = "Erreur"
+                row["error"] = str(exc)
+            rows.append(row)
+        return {"rows": rows, "safe_count": sum(1 for row in rows if row.get("eligible"))}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
+@app.post("/api/sources/mangabaka/automatch/manual-preview")
+def preview_manual_mangabaka_automatch(payload: MangaBakaAutomatchManualPreviewRequest) -> dict:
+    try:
+        api = api_or_401()
+        entity = api.get_series(payload.series_id)
+        current = dict(entity.get("metadata") or {})
+        books_metadata = entity.get("booksMetadata") if isinstance(entity.get("booksMetadata"), dict) else {}
+        if books_metadata.get("authors"):
+            current["authors"] = books_metadata["authors"]
+        candidate = session_store.mangabaka_client().get_series(payload.source_id)
+        source_metadata = dict(candidate.series_metadata or {})
+        proposed = conservative_mangabaka_payload(current, source_metadata)
+        base = {
+            "series_id": payload.series_id,
+            "matched_id": candidate.series_id,
+            "matched_title": candidate.title,
+            "matched_url": candidate.source_url,
+            "loaded_title": candidate.title,
+            "payload_fields": "; ".join(proposed.keys()),
+            "eligible": bool(proposed),
+        }
+        if not proposed:
+            return {**base, "status": "Choix manuel — aucun changement", "token": "", "diff": []}
+        preview = operations.preview_metadata(
+            api,
+            "series",
+            payload.series_id,
+            proposed,
+            "mangabaka_manual_automatch_webui",
+        )
+        return {**base, "status": "Choix manuel — prêt", **preview}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
+@app.post("/api/sources/mangabaka/automatch/apply")
+def apply_mangabaka_automatch(payload: MangaBakaAutomatchApplyRequest) -> dict:
+    try:
+        api = api_or_401()
+        results = [operations.apply_metadata(api, token) for token in dict.fromkeys(payload.tokens)]
+        return {"applied": sum(1 for row in results if row.get("status") == "applied"), "results": results}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/sources/nautiljon/automatch/preview")
+def preview_nautiljon_automatch(payload: NautiljonAutomatchPreviewRequest) -> dict:
+    """Prepare cautious, additive tag/link previews from the local CSV."""
+    try:
+        api = api_or_401()
+        client = session_store.nautiljon_client()
+        rows: list[dict[str, Any]] = []
+        for index, series_id in enumerate(dict.fromkeys(payload.series_ids), start=1):
+            row: dict[str, Any] = {
+                "index": index,
+                "series_id": series_id,
+                "komga_title": "",
+                "query": "",
+                "matched_title": "",
+                "match_score": 0.0,
+                "second_score": 0.0,
+                "status": "",
+                "tags_to_add": "",
+                "token": "",
+                "eligible": False,
+                "error": "",
+            }
+            try:
+                entity = api.get_series(series_id)
+                current = dict(entity.get("metadata") or {})
+                title = str(current.get("title") or entity.get("name") or series_id)
+                query = clean_nautiljon_query(title)
+                row.update({"komga_title": title, "query": query})
+                ENRICHMENT_HISTORY.record_search("nautiljon", series_id, title)
+                results = client.search(query, limit=50)
+                matched, status, best, second = select_nautiljon_automatch(results)
+                row.update({
+                    "status": status,
+                    "match_score": round(best, 3),
+                    "second_score": round(second, 3),
+                    "result_count": len(results),
+                    "choices": [
+                        {
+                            "title": result.title,
+                            "url": result.url,
+                            "match_score": round(result.match_score, 3),
+                            "alternate_title": result.alternate_title,
+                            "original_title": result.original_title,
+                        }
+                        for result in results[:5]
+                    ],
+                })
+                if matched is None:
+                    rows.append(row)
+                    continue
+                candidate = client.get_series(matched.url)
+                incoming_tags = list(candidate.series_metadata.get("tags") or [])
+                existing_keys = {str(value).strip().casefold() for value in current.get("tags") or []}
+                additions = [value for value in incoming_tags if str(value).strip().casefold() not in existing_keys]
+                row.update({
+                    "matched_title": matched.title,
+                    "matched_url": matched.url,
+                    "genres": "; ".join(candidate.raw.get("genres") or []),
+                    "themes": "; ".join(candidate.raw.get("themes") or []),
+                    "tags_to_add": "; ".join(additions),
+                })
+                preview = operations.preview_metadata(
+                    api,
+                    "series",
+                    series_id,
+                    candidate.series_metadata,
+                    "nautiljon_automatch_webui",
+                )
+                if not preview.get("changed_fields"):
+                    row["status"] = "OK : aucun changement"
+                    rows.append(row)
+                    continue
+                row.update({"status": "Prêt", "token": preview["token"], "eligible": True, "diff": preview["diff"]})
+            except Exception as exc:
+                row["status"] = "Erreur"
+                row["error"] = str(exc)
+            rows.append(row)
+        return {"rows": rows, "safe_count": sum(1 for row in rows if row.get("eligible"))}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
+@app.post("/api/sources/nautiljon/automatch/apply")
+def apply_nautiljon_automatch(payload: NautiljonAutomatchApplyRequest) -> dict:
+    try:
+        api = api_or_401()
+        results = [operations.apply_metadata(api, token) for token in dict.fromkeys(payload.tokens)]
+        return {"applied": sum(1 for row in results if row.get("status") == "applied"), "results": results}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/posters/{target_type}/{target_id}/search-apply")
+def apply_cover_search_result(
+    payload: PosterSearchApplyRequest,
+    target_type: Literal["series", "book"],
+    target_id: str,
+) -> dict:
+    if not payload.confirmed:
+        raise HTTPException(status_code=409, detail="Confirmation explicite requise")
+    try:
+        return _upload_remote_poster(
+            target_type,
+            target_id,
+            str(payload.url),
+            select_after_upload=True,
+            thumbnail_url=str(payload.thumbnail_url or ""),
+            source_url=str(payload.source_url or ""),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
 @app.post("/api/posters/{target_type}/{target_id}/upload-url")
 def upload_poster_url(
     payload: PosterUrlRequest,
@@ -1782,43 +2532,12 @@ def upload_poster_url(
 ) -> dict:
     if not payload.confirmed:
         raise HTTPException(status_code=409, detail="Confirmation explicite requise")
-    url = str(payload.url)
-    temp_path = ""
     try:
-        _require_public_http_url(url)
-        req = urlrequest.Request(url, headers={"User-Agent": "komga-toolkit-web/2.1"})
-        with urlrequest.urlopen(req, timeout=60) as response:
-            final_url = str(response.geturl() or url)
-            _require_public_http_url(final_url)
-            content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-            if not content_type.startswith("image/"):
-                raise ValueError("L'URL ne renvoie pas une image")
-            data = response.read(25 * 1024 * 1024 + 1)
-        if not data or len(data) > 25 * 1024 * 1024:
-            raise ValueError("Image vide ou supérieure à 25 Mio")
-        suffix = Path(urlparse(final_url).path).suffix.lower() or ".jpg"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-            handle.write(data)
-            temp_path = handle.name
-        operations.backup.save_json(
-            "operation", target_type, target_id,
-            {"poster_upload_url": final_url},
-            "WebUI avant upload poster URL",
-        )
-        return {
-            "status": "uploaded",
-            "response": api_or_401().add_thumbnail(target_type, target_id, temp_path),
-        }
+        return _upload_remote_poster(target_type, target_id, str(payload.url))
     except HTTPException:
         raise
     except Exception as exc:
         raise domain_error(exc) from exc
-    finally:
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
 
 
 @app.post("/api/csv/preview")
@@ -1959,6 +2678,302 @@ def start_audit(payload: AuditRequest) -> dict:
         return report
 
     return jobs.submit("Audit bibliothèque", action).public()
+
+
+@app.post("/api/cleanup/alternate-titles/scan")
+def scan_alternate_title_cleanup(payload: AlternateTitleCleanupScanRequest) -> dict:
+    """Analyze without mutating; ambiguous legacy ``alt`` values remain in place."""
+    try:
+        rows = scan_series_alternate_titles(api_or_401().series(payload.library_id, page_size=500))
+        if payload.added_days:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=payload.added_days)
+            filtered_rows: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    added = datetime.fromisoformat(str(row.get("added_at") or "").replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if added >= cutoff:
+                    filtered_rows.append(row)
+            rows = filtered_rows
+        return {
+            "rows": rows,
+            "series_count": len(rows),
+            "changed_count": sum(1 for row in rows if row.get("changed")),
+            "review_count": sum(int(row.get("review_count") or 0) for row in rows),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/cleanup/alternate-titles/preview")
+def preview_alternate_title_cleanup(payload: AlternateTitleCleanupPreviewRequest) -> dict:
+    """Recompute every proposed value server-side and return two-phase write tokens."""
+    api = api_or_401()
+    previews: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for change in payload.changes:
+        series_id = change.series_id
+        try:
+            entity = api.get_series(series_id)
+            _metadata, _title, analysis = analyze_series_entity_alternate_titles(
+                entity,
+                overrides=change.overrides,
+            )
+            if analysis["locked"]:
+                skipped.append({"series_id": series_id, "reason": "Titres alternatifs verrouillés"})
+            elif not analysis["changed"]:
+                skipped.append({"series_id": series_id, "reason": "Aucune correction sûre"})
+            else:
+                previews.append(operations.preview_metadata(
+                    api,
+                    "series",
+                    series_id,
+                    {"alternateTitles": analysis["proposed"]},
+                    "cleanup_alternate_titles_webui",
+                ))
+        except Exception as exc:
+            skipped.append({"series_id": series_id, "reason": SecretRedactor.redact(exc)})
+    return {
+        "previews": previews,
+        "tokens": [row["token"] for row in previews],
+        "skipped": skipped,
+    }
+
+
+@app.post("/api/cleanup/chapter-series/scan")
+def scan_chapter_series_cleanup(payload: ChapterSeriesCleanupScanRequest) -> dict:
+    """Scan physical ``Chap`` series without fetching their books or mutating Komga."""
+    try:
+        rows = scan_chapter_series(api_or_401().series(payload.library_id, page_size=500))
+        counts: dict[str, int] = {}
+        for row in rows:
+            status = str(row.get("status") or "")
+            counts[status] = counts.get(status, 0) + 1
+        return {
+            "rows": rows,
+            "series_count": len(rows),
+            "ready_count": counts.get("ready", 0),
+            "unchanged_count": counts.get("unchanged", 0),
+            "locked_count": counts.get("locked", 0),
+            "review_count": sum(counts.get(key, 0) for key in ("review", "duplicate", "collision")),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/cleanup/authors/scan")
+def scan_author_cleanup(payload: AuthorCleanupScanRequest) -> dict:
+    """Group author spellings without fetching books or mutating Komga."""
+    try:
+        rows = scan_author_groups(
+            api_or_401().series(payload.library_id, page_size=500),
+            operations.author_canonical_store.mappings(),
+            _cached_author_references(),
+        )
+        counts: dict[str, int] = {}
+        for row in rows:
+            confidence = str(row.get("confidence") or "review")
+            counts[confidence] = counts.get(confidence, 0) + 1
+        return {
+            "rows": rows,
+            "group_count": len(rows),
+            "confirmed_count": counts.get("confirmed", 0),
+            "safe_count": counts.get("safe", 0),
+            "likely_count": counts.get("likely", 0),
+            "review_count": counts.get("review", 0),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/cleanup/authors/preview")
+def preview_author_cleanup(payload: AuthorCleanupPreviewRequest) -> dict:
+    """Recompute selected author groups and return book-level two-phase write tokens."""
+    api = api_or_401()
+    stored_mappings = operations.author_canonical_store.mappings()
+    groups = scan_author_groups(
+        api.series(payload.library_id, page_size=500),
+        stored_mappings,
+        _cached_author_references(),
+    )
+    by_id = {str(row.get("group_id") or ""): row for row in groups}
+    mappings: dict[str, Any] = {}
+    series_ids: set[str] = set()
+    decisions: list[dict[str, Any]] = []
+    pending_decisions: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for requested in payload.changes:
+        group = by_id.get(requested.group_id)
+        if group is None:
+            skipped.append({"group_id": requested.group_id, "reason": "Groupe absent ou devenu différent"})
+            continue
+        replacements = [str(value or "").strip()[:1000] for value in requested.replacement_names if str(value or "").strip()]
+        replacement: Any = replacements if len(replacements) > 1 else (replacements[0] if replacements else requested.canonical.strip())
+        mappings.update(author_mapping_for_group(group, replacement))
+        aliases = [
+            str(item.get("name") or "")
+            for item in group.get("variants") or []
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        decision = {"aliases": aliases, "canonical": replacement}
+        decisions.append(decision)
+        if not author_decision_is_remembered(aliases, replacement, stored_mappings):
+            pending_decisions.append(decision)
+        series_ids.update(
+            str(item.get("id") or "")
+            for item in group.get("series") or []
+            if isinstance(item, dict) and str(item.get("id") or "")
+        )
+    previews: list[dict[str, Any]] = []
+    seen_books: set[str] = set()
+    for series_id in sorted(series_ids):
+        try:
+            for book in api.books(series_id=series_id, page_size=500, direct_series_only=True):
+                change = analyze_book_author_change(book, mappings)
+                book_id = str(change.get("book_id") or "")
+                if not change.get("changed") or not book_id or book_id in seen_books:
+                    continue
+                seen_books.add(book_id)
+                if change.get("locked"):
+                    skipped.append({"book_id": book_id, "reason": "Auteurs verrouillés"})
+                    continue
+                previews.append(operations.preview_metadata(
+                    api,
+                    "book",
+                    book_id,
+                    {"authors": change.get("proposed") or []},
+                    "cleanup_authors_webui",
+                    author_decisions=pending_decisions if not previews else None,
+                ))
+        except Exception as exc:
+            skipped.append({"series_id": series_id, "reason": SecretRedactor.redact(exc)})
+    decision_preview = operations.preview_author_decisions(pending_decisions) if pending_decisions and not previews else None
+    tokens = [row["token"] for row in previews]
+    if decision_preview:
+        tokens.append(decision_preview["token"])
+    return {
+        "previews": previews,
+        "tokens": tokens,
+        "skipped": skipped,
+        "book_count": len(previews),
+        "decision_count": len(pending_decisions),
+        "selected_decision_count": len(decisions),
+        "decision_only": bool(decision_preview),
+        "already_conformant": not previews and not pending_decisions,
+    }
+
+
+@app.post("/api/cleanup/chapter-series/preview")
+def preview_chapter_series_cleanup(payload: ChapterSeriesCleanupPreviewRequest) -> dict:
+    """Revalidate path-derived proposals and return normal two-phase write tokens."""
+    api = api_or_401()
+    previews: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for change in payload.changes:
+        try:
+            entity = api.get_series(change.series_id)
+            fresh = analyze_chapter_series_item(entity)
+            if fresh is None:
+                skipped.append({"series_id": change.series_id, "reason": "La série n'est plus un dossier Chap"})
+            elif fresh.get("path") != change.expected_path:
+                skipped.append({"series_id": change.series_id, "reason": "Le chemin Komga a changé"})
+            elif fresh.get("proposed_title") != change.expected_title:
+                skipped.append({"series_id": change.series_id, "reason": "La proposition a changé"})
+            elif fresh.get("status") == "locked":
+                skipped.append({"series_id": change.series_id, "reason": str(fresh.get("reason") or "Champs verrouillés")})
+            elif fresh.get("status") == "unchanged" or not fresh.get("payload"):
+                skipped.append({"series_id": change.series_id, "reason": "Déjà conforme"})
+            else:
+                previews.append(operations.preview_metadata(
+                    api,
+                    "series",
+                    change.series_id,
+                    dict(fresh.get("payload") or {}),
+                    "cleanup_chapter_series_webui",
+                ))
+        except Exception as exc:
+            skipped.append({"series_id": change.series_id, "reason": SecretRedactor.redact(exc)})
+    return {
+        "previews": previews,
+        "tokens": [row["token"] for row in previews],
+        "skipped": skipped,
+    }
+
+
+@app.post("/api/cleanup/languages/scan")
+def scan_languages_cleanup(payload: LanguageCleanupScanRequest) -> dict:
+    """Analyze series/book languages using only local metadata and configured sources."""
+    try:
+        api = api_or_401()
+        series = api.series(payload.library_id, page_size=500)
+        books = api.books(library_id=payload.library_id, page_size=1000) if payload.scope in {"books", "both"} else []
+        try:
+            bedetheque_languages = session_store.bedetheque_client().language_map()
+        except Exception:
+            bedetheque_languages = {}
+        rows = scan_language_cleanup(
+            series,
+            books,
+            bedetheque_languages=bedetheque_languages,
+            include_series=payload.scope in {"series", "both"},
+            include_books=payload.scope in {"books", "both"},
+        )
+        return {
+            "rows": rows,
+            "target_count": len(rows),
+            "changed_count": sum(1 for row in rows if row.get("changed")),
+            "safe_count": sum(1 for row in rows if row.get("changed") and row.get("confidence") == "safe"),
+            "likely_count": sum(1 for row in rows if row.get("changed") and row.get("confidence") == "likely"),
+            "review_count": sum(1 for row in rows if row.get("confidence") == "review"),
+            "locked_count": sum(1 for row in rows if row.get("confidence") == "locked"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/cleanup/languages/preview")
+def preview_languages_cleanup(payload: LanguageCleanupPreviewRequest) -> dict:
+    """Revalidate selected language changes and return two-phase write tokens."""
+    api = api_or_401()
+    previews: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for change in payload.changes:
+        try:
+            proposed = normalize_cleanup_language(change.proposed_language)
+            if not proposed:
+                skipped.append({"target_id": change.target_id, "reason": "Langue proposée invalide"})
+                continue
+            entity = api.get_series(change.target_id) if change.target_type == "series" else api.get_book(change.target_id)
+            metadata = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+            if metadata.get("languageLock"):
+                skipped.append({"target_id": change.target_id, "reason": "Champ language verrouillé"})
+                continue
+            if normalize_cleanup_language(metadata.get("language")) == proposed:
+                skipped.append({"target_id": change.target_id, "reason": "Déjà conforme"})
+                continue
+            previews.append(operations.preview_metadata(
+                api,
+                change.target_type,
+                change.target_id,
+                {"language": proposed},
+                "cleanup_languages_webui",
+            ))
+        except Exception as exc:
+            skipped.append({"target_id": change.target_id, "reason": SecretRedactor.redact(exc)})
+    return {
+        "previews": previews,
+        "tokens": [row["token"] for row in previews],
+        "skipped": skipped,
+    }
 
 
 STATIC_DIR = Path(__file__).with_name("static")

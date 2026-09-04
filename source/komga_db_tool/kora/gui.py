@@ -43,35 +43,13 @@ from .csv_import import read_csv_changes
 from .local_exclusions import LocalExclusionsStore
 from .models import PendingChange, SeriesRecord
 from .operations import apply_pending_changes
+from .suggestion_dialog import KoraSuggestionDialog
+from .suggestions import suggest_genre_for_value, suggest_series_genres
 from .tag_logic import genre_label, merge_series_tags_for_genres, normalize_slug, readable_genres, validate_genres
 from ..qt_tasks import Worker
 from ..runtime import SecretRedactor
 
 MIN_TABLE_VISIBLE_ROWS = 5
-
-TAG_TO_GENRE_HINTS: dict[str, str] = {
-    "adventure": "aventure",
-    "biographie": "documentaire-biographie",
-    "biography": "documentaire-biographie",
-    "crime": "policier-crime",
-    "detective": "policier-crime",
-    "fantastic": "fantastique-surnaturel",
-    "fantastique": "fantastique-surnaturel",
-    "historical": "historique",
-    "history": "historique",
-    "humour": "comedie",
-    "mystery": "mystere",
-    "policier": "policier-crime",
-    "sci-fi": "science-fiction",
-    "scifi": "science-fiction",
-    "science-fiction": "science-fiction",
-    "superhero": "super-heros",
-    "superheroes": "super-heros",
-    "super-heros": "super-heros",
-    "super-héros": "super-heros",
-    "suspense": "thriller-suspense",
-}
-
 
 class MainWindow(QMainWindow):
     def __init__(
@@ -398,8 +376,12 @@ class MainWindow(QMainWindow):
         self.series_table_search_edit = QLineEdit()
         self.series_table_search_edit.setPlaceholderText("Rechercher une série…")
         self.series_table_search_edit.textChanged.connect(self.on_series_top_search_changed)
+        self.btn_suggest_selection = QPushButton("Suggérer les genres Kora")
+        self.btn_suggest_selection.setEnabled(False)
+        self.btn_suggest_selection.clicked.connect(self.open_selected_kora_suggestions)
         search_row.addWidget(QLabel("Recherche"))
         search_row.addWidget(self.series_table_search_edit, 1)
+        search_row.addWidget(self.btn_suggest_selection)
         layout.addLayout(search_row)
 
         self.series_table = QTableWidget(0, 8)
@@ -1029,18 +1011,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _suggest_kora_genre_for_tag(value: str) -> tuple[str, int]:
-        slug = normalize_slug(value)
-        if slug in KORA_GENRES:
-            return slug, 100
-        if slug in TAG_TO_GENRE_HINTS:
-            return TAG_TO_GENRE_HINTS[slug], 90
-        for token, genre in TAG_TO_GENRE_HINTS.items():
-            if token in slug:
-                return genre, 75
-        for genre in KORA_GENRES:
-            if genre in slug:
-                return genre, 70
-        return "", 0
+        return suggest_genre_for_value(value)
 
     def analyze_tag_genre_suggestions(self) -> None:
         if not hasattr(self, "tag_suggestion_table"):
@@ -1200,7 +1171,64 @@ class MainWindow(QMainWindow):
     def on_series_selection_changed(self) -> None:
         records = self.selected_records()
         self.current_record = records[0] if records else None
+        if hasattr(self, "btn_suggest_selection"):
+            self.btn_suggest_selection.setEnabled(bool(records))
+            self.btn_suggest_selection.setText(
+                f"Suggérer les genres Kora ({len(records)})"
+                if records
+                else "Suggérer les genres Kora"
+            )
         self.populate_detail_selection(records)
+
+    def open_selected_kora_suggestions(self) -> None:
+        records = self.selected_records()
+        if not records:
+            QMessageBox.information(self, APP_NAME, "Sélectionne au moins une série.")
+            return
+        pending = self.pending_genres_by_series_id()
+        suggestions = [
+            suggest_series_genres(
+                record,
+                current_genres=pending.get(record.id, record.kora_genres),
+                has_pending=record.id in pending,
+            )
+            for record in records
+        ]
+        dialog = KoraSuggestionDialog(suggestions, self)
+        if not dialog.exec():
+            return
+        changes = dialog.selected_changes()
+        if dialog.action == "queue":
+            for change in changes:
+                self.cache.add_pending(change)
+            self.invalidate_pending_genres_cache()
+            self.refresh_pending_table()
+            self.refresh_series_table()
+            self.refresh_genre_inventory()
+            self.log(f"Suggestions Kora : {len(changes)} modification(s) mise(s) en attente.")
+            return
+        if dialog.action != "apply" or not changes:
+            return
+        if not self.require_connection("Application des suggestions Kora"):
+            return
+        reply = QMessageBox.question(
+            self,
+            APP_NAME,
+            f"Appliquer réellement {len(changes)} suggestion(s) de genres dans Komga ?",
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        def work() -> dict[str, Any]:
+            return apply_pending_changes(
+                self.komga_api(),
+                self.cache,
+                self.backup,
+                changes,
+                dry_run=False,
+            )
+
+        self.run_worker("Application suggestions Kora", work, self.after_apply)
 
     def show_series_context_menu(self, position) -> None:
         item = self.series_table.itemAt(position)

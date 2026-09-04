@@ -7,9 +7,9 @@ from typing import Any
 
 from .bedetheque import (
     BedethequeCandidate,
-    BedethequeClient,
     BedethequeSearchResult,
     _fold,
+    candidate_to_dict,
     title_similarity,
 )
 
@@ -38,6 +38,8 @@ def _language(value: str) -> str:
         "allemand": "de",
         "espagnol": "es",
         "italien": "it",
+        "portugais": "pt",
+        "neerlandais": "nl",
     }.get(folded, "")
 
 
@@ -92,6 +94,20 @@ class BedethequeCsvClient:
 
     def test(self) -> str:
         return f"CSV Bedetheque : {len(self._rows())} série(s)"
+
+    def language_for_url(self, url: str) -> str:
+        """Return the normalized edition language for one exact CSV URL."""
+        return _language(self._row_for_url(url).get("language", ""))
+
+    def language_map(self) -> dict[str, str]:
+        """Return exact normalized URL -> language mappings for cleanup scans."""
+        out: dict[str, str] = {}
+        for row in self._rows():
+            url = row.get("serieUrl", "").strip().rstrip("/").casefold()
+            language = _language(row.get("language", ""))
+            if url and language:
+                out[url] = language
+        return out
 
     def search(self, query: str) -> list[BedethequeSearchResult]:
         folded_query = _fold(query).strip()
@@ -163,11 +179,6 @@ class BedethequeCsvClient:
     def scrape(self, url: str, album_number: str = "") -> BedethequeCandidate:
         return self.scrape_series(url)
 
-    def scrape_album(self, album_url: str) -> BedethequeCandidate:
-        raise RuntimeError(
-            "Le CSV Bedetheque ne contient pas les albums. Passe en mode Site web pour les tomes."
-        )
-
     @staticmethod
     def candidate_to_dict(candidate: BedethequeCandidate) -> dict[str, Any]:
-        return BedethequeClient.candidate_to_dict(candidate)
+        return candidate_to_dict(candidate)

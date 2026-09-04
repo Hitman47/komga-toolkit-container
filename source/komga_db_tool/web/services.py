@@ -10,6 +10,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ..author_cleanup import AuthorCanonicalStore
+from ..chapter_cleanup import is_series_enrichment_source, preserve_chapter_series_title_suffix
+from ..manga_news import manga_news_edition_label_from_url, merge_manga_news_edition_links
+from ..metadata_cleanup import merge_incoming_alternate_titles
+from ..nautiljon import merge_nautiljon_links, merge_nautiljon_tags
+
 from ..backup import BackupManager, list_rollback_records, load_rollback_snapshot
 
 
@@ -46,6 +52,7 @@ class MutationPreview:
     source: str
     created_at: float
     expires_at: float
+    author_decisions: list[dict[str, Any]] | None = None
 
 
 class WebOperationService:
@@ -57,6 +64,7 @@ class WebOperationService:
         self._backup: BackupManager | None = None
         self._previews: dict[str, MutationPreview] = {}
         self._lock = threading.RLock()
+        self.author_canonical_store = AuthorCanonicalStore(self.data_dir / "author_cleanup_decisions.json")
 
     @property
     def backup(self) -> BackupManager:
@@ -73,6 +81,7 @@ class WebOperationService:
         payload: dict[str, Any],
         before: dict[str, Any],
         source: str,
+        author_decisions: list[dict[str, Any]] | None = None,
     ) -> MutationPreview:
         now = time.time()
         preview = MutationPreview(
@@ -85,6 +94,7 @@ class WebOperationService:
             source=source,
             created_at=now,
             expires_at=now + 900,
+            author_decisions=list(author_decisions or []),
         )
         with self._lock:
             self._previews[preview.token] = preview
@@ -107,9 +117,59 @@ class WebOperationService:
             raise LookupError("Prévisualisation absente ou expirée")
         if preview.kind in {"series.metadata", "book.metadata"}:
             return self.apply_metadata(api, token)
+        if preview.kind == "author.decisions":
+            return self.apply_author_decisions(token)
         if preview.kind in {"collection.create", "collection.update", "readlist.create", "readlist.update"}:
             return self.apply_resource(api, token)
         raise ValueError("Type de prévisualisation inconnu")
+
+    def preview_author_decisions(self, decisions: list[dict[str, Any]]) -> dict[str, Any]:
+        clean = [
+            {
+                "aliases": [str(alias) for alias in decision.get("aliases") or [] if str(alias).strip()],
+                "canonical": decision.get("canonical") or "",
+            }
+            for decision in decisions
+            if isinstance(decision, dict) and decision.get("canonical")
+        ]
+        if not clean:
+            raise ValueError("Décisions d'auteurs requises")
+        preview = self._put_preview(
+            kind="author.decisions",
+            target_id="author_cleanup",
+            payload={"decision_count": len(clean)},
+            before={},
+            source="cleanup_authors_webui",
+            author_decisions=clean,
+        )
+        return {
+            "token": preview.token,
+            "kind": preview.kind,
+            "target_id": preview.target_id,
+            "source": preview.source,
+            "expires_at": preview.expires_at,
+            "decision_count": len(clean),
+            "diff": [],
+            "changed_fields": [],
+        }
+
+    def apply_author_decisions(self, token: str) -> dict[str, Any]:
+        preview = self._take_preview(token)
+        if preview.kind != "author.decisions":
+            raise ValueError("Type de prévisualisation invalide pour les décisions d'auteurs")
+        remembered = 0
+        for decision in preview.author_decisions or []:
+            self.author_canonical_store.remember(
+                decision.get("aliases") if isinstance(decision.get("aliases"), list) else [],
+                decision.get("canonical") or "",
+            )
+            remembered += 1
+        return {
+            "status": "confirmed",
+            "target_type": "author_decisions",
+            "target_id": preview.target_id,
+            "decision_count": remembered,
+        }
 
     def _purge_locked(self, now: float) -> None:
         for token in [key for key, value in self._previews.items() if value.expires_at <= now]:
@@ -122,6 +182,7 @@ class WebOperationService:
         target_id: str,
         payload: dict[str, Any],
         source: str = "webui",
+        author_decisions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if target_type not in {"series", "book"}:
             raise ValueError("Type de cible metadata invalide")
@@ -129,12 +190,57 @@ class WebOperationService:
             raise ValueError("Cible et payload metadata requis")
         entity = api.get_series(target_id) if target_type == "series" else api.get_book(target_id)
         current = _metadata_from_entity(entity)
+        if "authors" in payload and not source.startswith("cleanup_authors"):
+            payload = dict(payload)
+            payload["authors"] = self.author_canonical_store.normalize_entries(payload.get("authors"))
+        if target_type == "series" and is_series_enrichment_source(source):
+            payload = preserve_chapter_series_title_suffix(current, payload)
+        if target_type == "series" and source.startswith("nautiljon"):
+            # Nautiljon is additive by contract: never replace user tags or links.
+            payload = dict(payload)
+            payload["tags"] = merge_nautiljon_tags(
+                current.get("tags"), payload.get("tags") if isinstance(payload.get("tags"), list) else []
+            )
+            candidate_links = payload.get("links") if isinstance(payload.get("links"), list) else []
+            nautiljon_url = next(
+                (
+                    str(row.get("url") or "")
+                    for row in candidate_links
+                    if isinstance(row, dict)
+                    and str(row.get("label") or "").strip().casefold() == "nautiljon"
+                ),
+                "",
+            )
+            payload["links"] = merge_nautiljon_links(current.get("links"), nautiljon_url)
+        if (
+            target_type == "series"
+            and "alternateTitles" in payload
+            and source.startswith(("bedetheque", "mangabaka", "manga_news", "comicvine"))
+        ):
+            payload = dict(payload)
+            payload["alternateTitles"] = merge_incoming_alternate_titles(
+                current.get("alternateTitles"),
+                payload.get("alternateTitles"),
+                primary_title=str(current.get("title") or entity.get("name") or ""),
+            )
+        candidate_links = payload.get("links") if isinstance(payload.get("links"), list) else []
+        has_manga_news_edition = any(
+            isinstance(row, dict) and manga_news_edition_label_from_url(row.get("url"))
+            for row in candidate_links
+        )
+        if target_type == "series" and source.startswith("manga_news") and has_manga_news_edition:
+            payload = dict(payload)
+            payload["links"] = merge_manga_news_edition_links(
+                current.get("links"),
+                payload.get("links"),
+            )
         preview = self._put_preview(
             kind=f"{target_type}.metadata",
             target_id=target_id,
             payload=payload,
             before=current,
             source=source,
+            author_decisions=author_decisions,
         )
         return {
             "token": preview.token,
@@ -153,9 +259,24 @@ class WebOperationService:
         fresh = _metadata_from_entity(entity)
         if _digest(fresh) != preview.before_digest:
             raise RuntimeError("Les métadonnées ont changé depuis la prévisualisation")
-        changed = {key: value for key, value in preview.payload.items() if fresh.get(key) != value}
+        effective_payload = preview.payload
+        if target_type == "series" and is_series_enrichment_source(preview.source):
+            effective_payload = preserve_chapter_series_title_suffix(fresh, effective_payload)
+        changed = {key: value for key, value in effective_payload.items() if fresh.get(key) != value}
         if not changed:
-            return {"status": "unchanged", "target_type": target_type, "target_id": preview.target_id}
+            remembered = 0
+            for decision in preview.author_decisions or []:
+                self.author_canonical_store.remember(
+                    decision.get("aliases") if isinstance(decision.get("aliases"), list) else [],
+                    decision.get("canonical") or "",
+                )
+                remembered += 1
+            return {
+                "status": "confirmed" if remembered else "unchanged",
+                "target_type": target_type,
+                "target_id": preview.target_id,
+                "decision_count": remembered,
+            }
         self.backup.save_rollback_candidate(
             target_type,
             preview.target_id,
@@ -175,6 +296,11 @@ class WebOperationService:
                 if target_type == "series"
                 else api.update_book_metadata(preview.target_id, changed)
             )
+            for decision in preview.author_decisions or []:
+                self.author_canonical_store.remember(
+                    decision.get("aliases") if isinstance(decision.get("aliases"), list) else [],
+                    decision.get("canonical") or "",
+                )
             self.backup.save_audit(
                 target_type,
                 preview.target_id,

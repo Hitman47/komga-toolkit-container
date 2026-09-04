@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 APP_NAME = "Kora Komga Genre Manager"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.3.0"
 APP_USER_AGENT = f"kora-komga-genre-manager/{APP_VERSION}"
 
 KORA_GENRE_PREFIX = "kora:genre:"
