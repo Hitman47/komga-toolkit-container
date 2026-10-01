@@ -10,12 +10,40 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: publish-container-main
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: ghcr.io/hitman47/komga-toolkit-container
+      RELEASE: 2.52.0
     steps:
       - name: Check out validated container snapshot
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build release for validation
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source
+          load: true
+          push: false
+          tags: ghcr.io/hitman47/komga-toolkit-container:2.52.0
+
+      - name: Test isolated read-only runtime and WebUI version
+        run: |
+          docker run --detach --name toolkit-smoke \
+            --read-only --tmpfs /data:rw,size=96m,uid=10001,gid=10001,mode=0700 \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --publish 127.0.0.1:8000:8000 \
+            "$IMAGE:$RELEASE"
+          python3 scripts/smoke_container.py
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -24,11 +52,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish immutable and reference tags
-        uses: docker/build-push-action@v6
-        with:
-          context: ./source
-          push: true
-          tags: |
-            ghcr.io/hitman47/komga-toolkit-container:2.24.0-desktop-v2
-            ghcr.io/hitman47/komga-toolkit-container:desktop-v2
+      - name: Publish the tested image
+        run: |
+          docker tag "$IMAGE:$RELEASE" "$IMAGE:$RELEASE-desktop-v2"
+          docker tag "$IMAGE:$RELEASE" "$IMAGE:desktop-v2"
+          docker push "$IMAGE:$RELEASE"
+          docker push "$IMAGE:$RELEASE-desktop-v2"
+          docker push "$IMAGE:desktop-v2"
+          echo "### Published validated release $RELEASE" >> "$GITHUB_STEP_SUMMARY"
+          docker inspect --format '{{json .RepoDigests}}' "$IMAGE:$RELEASE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Runtime diagnostics on failure
+        if: failure()
+        run: docker logs toolkit-smoke || true
+
+      - name: Remove isolated test container
+        if: always()
+        run: docker rm --force toolkit-smoke || true

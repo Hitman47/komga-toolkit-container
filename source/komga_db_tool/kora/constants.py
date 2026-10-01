@@ -8,7 +8,7 @@ KORA_GENRE_PREFIX = "kora:genre:"
 KORA_TAG_PREFIX = "kora:tag:"
 KORA_TAXONOMY_PREFIX = "kora:taxonomy:"
 
-MAX_KORA_GENRES = 4
+MAX_KORA_GENRES = 5
 LOCAL_EXCLUSIONS_FILENAME = ".kora_local_exclusions.json"
 
 KORA_GENRES: tuple[str, ...] = (

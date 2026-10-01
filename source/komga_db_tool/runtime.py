@@ -58,6 +58,8 @@ class MemoryCache:
         self.max_entries = max(1, max_entries)
         self._entries: OrderedDict[str, CacheEntry[Any]] = OrderedDict()
         self._lock = threading.RLock()
+        self._inflight: dict[str, tuple[threading.Event, int]] = {}
+        self._generation = 0
         self.hits = 0
         self.misses = 0
 
@@ -94,13 +96,47 @@ class MemoryCache:
         ttl_seconds: float = 300,
     ) -> T:
         marker = object()
-        cached = self.get(key, marker)
-        if cached is not marker:
-            return cached
-        return self.set(key, loader(), ttl_seconds)
+        while True:
+            cached = self.get(key, marker)
+            if cached is not marker:
+                return cached
+            with self._lock:
+                pending = self._inflight.get(key)
+                if pending is None:
+                    event = threading.Event()
+                    generation = self._generation
+                    self._inflight[key] = (event, generation)
+                    break
+                event, _generation = pending
+            # Another request is already loading this exact key. Waiting here
+            # prevents duplicate full-library reads while keeping unrelated
+            # keys concurrent.
+            event.wait()
+
+        try:
+            value = loader()
+        except Exception:
+            with self._lock:
+                current = self._inflight.get(key)
+                if current is not None and current[0] is event:
+                    self._inflight.pop(key, None)
+                    event.set()
+            raise
+
+        with self._lock:
+            current = self._inflight.get(key)
+            if generation == self._generation:
+                self.set(key, value, ttl_seconds)
+            if current is not None and current[0] is event:
+                self._inflight.pop(key, None)
+                event.set()
+        return value
 
     def invalidate(self, prefix: str = "") -> int:
         with self._lock:
+            # A loader started before a write/reconnect must not repopulate the
+            # cache with an obsolete snapshot when it eventually completes.
+            self._generation += 1
             keys = [
                 key for key in self._entries
                 if not prefix or key == prefix or key.startswith(prefix)

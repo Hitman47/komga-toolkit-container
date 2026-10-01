@@ -17,6 +17,7 @@ from ..metadata_cleanup import merge_incoming_alternate_titles
 from ..nautiljon import merge_nautiljon_links, merge_nautiljon_tags
 
 from ..backup import BackupManager, list_rollback_records, load_rollback_snapshot
+from ..series_identity import assess_identity
 
 
 def _metadata_from_entity(entity: dict[str, Any]) -> dict[str, Any]:
@@ -53,6 +54,7 @@ class MutationPreview:
     created_at: float
     expires_at: float
     author_decisions: list[dict[str, Any]] | None = None
+    identity: dict[str, Any] | None = None
 
 
 class WebOperationService:
@@ -110,13 +112,13 @@ class WebOperationService:
             raise LookupError("Prévisualisation absente ou expirée")
         return preview
 
-    def apply_any(self, api: Any, token: str) -> dict[str, Any]:
+    def apply_any(self, api: Any, token: str, identity_confirmed: bool = False) -> dict[str, Any]:
         with self._lock:
             preview = self._previews.get(token)
         if preview is None:
             raise LookupError("Prévisualisation absente ou expirée")
         if preview.kind in {"series.metadata", "book.metadata"}:
-            return self.apply_metadata(api, token)
+            return self.apply_metadata(api, token, identity_confirmed=identity_confirmed)
         if preview.kind == "author.decisions":
             return self.apply_author_decisions(token)
         if preview.kind in {"collection.create", "collection.update", "readlist.create", "readlist.update"}:
@@ -183,6 +185,8 @@ class WebOperationService:
         payload: dict[str, Any],
         source: str = "webui",
         author_decisions: list[dict[str, Any]] | None = None,
+        identity_candidate: dict[str, Any] | None = None,
+        identity_peers: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if target_type not in {"series", "book"}:
             raise ValueError("Type de cible metadata invalide")
@@ -190,6 +194,13 @@ class WebOperationService:
             raise ValueError("Cible et payload metadata requis")
         entity = api.get_series(target_id) if target_type == "series" else api.get_book(target_id)
         current = _metadata_from_entity(entity)
+        identity = None
+        if target_type == "series" and is_series_enrichment_source(source):
+            identity_current = dict(current)
+            identity_current.setdefault("title", entity.get("name", ""))
+            if (entity.get("booksMetadata") or {}).get("authors"):
+                identity_current["authors"] = entity["booksMetadata"]["authors"]
+            identity = assess_identity(identity_current, identity_candidate or payload, identity_peers or [])
         if "authors" in payload and not source.startswith("cleanup_authors"):
             payload = dict(payload)
             payload["authors"] = self.author_canonical_store.normalize_entries(payload.get("authors"))
@@ -198,6 +209,12 @@ class WebOperationService:
         if target_type == "series" and source.startswith("nautiljon"):
             # Nautiljon is additive by contract: never replace user tags or links.
             payload = dict(payload)
+            # Komga derives series authors from book ComicInfo; series PATCH
+            # cannot write them. VF counts/status must not touch EN/JA editions.
+            payload.pop("authors", None)
+            if str(current.get("language") or "").strip().casefold() not in {"", "fr", "fra", "fr-fr"}:
+                payload.pop("status", None)
+                payload.pop("totalBookCount", None)
             payload["tags"] = merge_nautiljon_tags(
                 current.get("tags"), payload.get("tags") if isinstance(payload.get("tags"), list) else []
             )
@@ -242,17 +259,23 @@ class WebOperationService:
             source=source,
             author_decisions=author_decisions,
         )
+        preview.identity = identity
         return {
             "token": preview.token,
             "kind": preview.kind,
             "target_id": target_id,
+            "identity": identity,
             "source": source,
             "expires_at": preview.expires_at,
             "diff": metadata_diff(current, payload),
             "changed_fields": [row["field"] for row in metadata_diff(current, payload) if row["changed"]],
         }
 
-    def apply_metadata(self, api: Any, token: str) -> dict[str, Any]:
+    def apply_metadata(self, api: Any, token: str, identity_confirmed: bool = False) -> dict[str, Any]:
+        with self._lock:
+            pending = self._previews.get(token)
+            if pending and pending.identity and not pending.identity["safe"] and not identity_confirmed:
+                raise ValueError("Identité de série non confirmée : validation explicite de la correspondance requise")
         preview = self._take_preview(token)
         target_type = preview.kind.split(".", 1)[0]
         entity = api.get_series(preview.target_id) if target_type == "series" else api.get_book(preview.target_id)

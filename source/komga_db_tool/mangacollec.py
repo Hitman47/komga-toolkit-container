@@ -5,11 +5,13 @@ import io
 import json
 import os
 import re
+import tempfile
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
+from threading import RLock
 from typing import Any, Iterable
 
 
@@ -146,20 +148,28 @@ def _series_identity(row: Any) -> tuple[str, str, dict[str, Any], list[str]]:
 
 
 class MangaCollecStore:
-    def __init__(self, root: str | Path = ".komga_db_tool_cache/mangacollec") -> None:
+    def __init__(self, root: str | Path = ".komga_db_tool_cache/mangacollec", *, source_path="") -> None:
         self.root = Path(root)
         self.catalog_path = self.root / "catalog.json"
         self.mappings_path = self.root / "mappings.json"
+        self._lock = RLock()
+        self._source_error = ""
+        self._failed_stamp = None
+        self._configured_source = str(source_path or "")
 
     @staticmethod
     def _atomic_json(path: Path, payload: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(path)
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def import_bytes(self, data: bytes, filename: str = "") -> dict[str, Any]:
         releases, summary = parse_export(data, filename)
@@ -168,12 +178,56 @@ class MangaCollecStore:
             "summary": summary,
             "releases": [asdict(item) for item in releases],
         }
-        self._atomic_json(self.catalog_path, payload)
-        return self.status()
+        with self._lock:
+            self._atomic_json(self.catalog_path, payload)
+            self._configured_source = ""
+            self._source_error = ""
+            self._failed_stamp = None
+            return self.status()
 
     def import_file(self, path: str | Path) -> dict[str, Any]:
-        source = Path(path)
-        return self.import_bytes(source.read_bytes(), source.name)
+        source = Path(path).expanduser().resolve()
+        with self._lock:
+            before = source.stat()
+            releases, summary = parse_export(source.read_bytes(), source.name)
+            after = source.stat()
+            if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
+                raise ValueError("Fichier MangaCollec en cours d’écriture ; catalogue précédent conservé")
+            self._atomic_json(self.catalog_path, {
+                "source_filename": source.name, "source_path": str(source),
+                "source_mtime_ns": before.st_mtime_ns, "source_size": before.st_size,
+                "summary": summary, "releases": [asdict(item) for item in releases],
+            })
+            self._source_error = ""
+            self._failed_stamp = None
+            self._configured_source = str(source)
+            return self.status()
+
+    def refresh_if_changed(self, *, force=False) -> bool:
+        """Follow a linked export, retaining the valid catalog and manual mappings."""
+        with self._lock:
+            payload = self._catalog_payload()
+            path = self._configured_source or payload.get("source_path")
+            if not path:
+                return False
+            stamp = None
+            try:
+                stat = Path(path).stat()
+                stamp = (str(path), stat.st_mtime_ns, stat.st_size)
+                if not force and stamp == self._failed_stamp:
+                    return False
+                previous = (payload.get("source_mtime_ns", 0), payload.get("source_size", 0))
+                same_source = str(Path(path).resolve()) == payload.get("source_path")
+                if same_source and ((stat.st_mtime_ns, stat.st_size) == previous or stat.st_mtime_ns < previous[0]):
+                    self._source_error = ""
+                    self._failed_stamp = None
+                    return False
+                self.import_file(path)
+                return True
+            except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+                self._source_error = f"Catalogue conservé en secours : {exc}"
+                self._failed_stamp = stamp
+                return False
 
     def _catalog_payload(self) -> dict[str, Any]:
         if not self.catalog_path.is_file():
@@ -182,6 +236,7 @@ class MangaCollecStore:
         return payload if isinstance(payload, dict) else {}
 
     def releases(self) -> list[MangaCollecRelease]:
+        self.refresh_if_changed()
         rows = self._catalog_payload().get("releases") or []
         result: list[MangaCollecRelease] = []
         for row in rows:
@@ -197,12 +252,16 @@ class MangaCollecStore:
                 continue
         return result
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, refresh=True) -> dict[str, Any]:
+        if refresh:
+            self.refresh_if_changed()
         payload = self._catalog_payload()
         stat = self.catalog_path.stat() if self.catalog_path.is_file() else None
         summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
         return {
             "configured": stat is not None,
+            "source_path": str(payload.get("source_path") or ""),
+            "source_status": self._source_error or ("Fichier lié — actualisation automatique" if payload.get("source_path") else "Catalogue importé"),
             "filename": str(payload.get("source_filename") or ""),
             "updated_at": stat.st_mtime if stat is not None else 0,
             **summary,

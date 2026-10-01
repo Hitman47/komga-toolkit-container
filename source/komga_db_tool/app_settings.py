@@ -42,6 +42,11 @@ class NautiljonSettings:
 
 
 @dataclass
+class MangaCollecSettings:
+    file_path: str = ""
+
+
+@dataclass
 class SourceSettings:
     url: str = DEFAULT_API_BASE_URL
     enabled: bool = True
@@ -98,6 +103,7 @@ class AppConfig:
     komf: ServiceSettings = field(default_factory=ServiceSettings)
     bedetheque: BedethequeSettings = field(default_factory=BedethequeSettings)
     nautiljon: NautiljonSettings = field(default_factory=NautiljonSettings)
+    mangacollec: MangaCollecSettings = field(default_factory=MangaCollecSettings)
     mangabaka: SourceSettings = field(default_factory=SourceSettings)
     manga_news: MangaNewsSettings = field(default_factory=MangaNewsSettings)
     comicvine: ComicVineSettings = field(default_factory=ComicVineSettings)
@@ -119,6 +125,7 @@ class AppConfig:
             komf=_section(ServiceSettings, data.get("komf")),
             bedetheque=_section(BedethequeSettings, data.get("bedetheque")),
             nautiljon=_section(NautiljonSettings, data.get("nautiljon")),
+            mangacollec=_section(MangaCollecSettings, data.get("mangacollec")),
             mangabaka=_section(SourceSettings, data.get("mangabaka")),
             manga_news=_section(MangaNewsSettings, data.get("manga_news")),
             comicvine=_section(ComicVineSettings, data.get("comicvine")),

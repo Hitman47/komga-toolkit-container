@@ -143,20 +143,15 @@ def _title_values(value: Any) -> List[str]:
 
 def mangabaka_match_score(query: Any, row: Any) -> float:
     """Score a MangaBaka result/candidate against all useful source titles."""
-    query_title = mangabaka_search_title(query)
-    raw = getattr(row, "raw", {}) if not isinstance(row, dict) else row.get("raw", row)
-    raw = raw if isinstance(raw, dict) else {}
-    titles = [getattr(row, "title", "") if not isinstance(row, dict) else row.get("title", "")]
-    for key in ("title", "native_title", "romanized_title", "secondary_titles", "titles"):
-        titles.extend(_title_values(raw.get(key)))
-    scores = [title_similarity(query_title, mangabaka_search_title(title)) for title in titles if str(title or "").strip()]
-    return max(scores, default=0.0)
+    from .series_identity import match_titles
+    return match_titles(query, row)["score"]
 
 
 def mangabaka_primary_match_score(query: Any, row: Any) -> float:
     """Score only the title displayed as the result's primary title."""
     title = getattr(row, "title", "") if not isinstance(row, dict) else row.get("title", "")
-    return title_similarity(mangabaka_search_title(query), mangabaka_search_title(title))
+    from .series_identity import match_titles
+    return match_titles(query, {"title": title})["score"]
 
 
 def ranked_mangabaka_choices(

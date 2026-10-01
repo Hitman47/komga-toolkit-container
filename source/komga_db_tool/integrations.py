@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from typing import Any
 
 from .api import HttpError, KomgaApi
@@ -7,9 +9,18 @@ from .runtime import MemoryCache
 
 
 class CachedKomgaService:
-    def __init__(self, api: KomgaApi, cache: MemoryCache):
+    def __init__(
+        self,
+        api: KomgaApi,
+        cache: MemoryCache,
+        *,
+        content_ttl_seconds: float = 300,
+        thumbnail_ttl_seconds: float = 900,
+    ):
         self.api = api
         self.cache = cache
+        self.content_ttl_seconds = max(1.0, float(content_ttl_seconds))
+        self.thumbnail_ttl_seconds = max(1.0, float(thumbnail_ttl_seconds))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.api, name)
@@ -30,10 +41,11 @@ class CachedKomgaService:
         key = f"komga:series:{library_id or '*'}:{search.strip().casefold()}:{page_size}"
         if force:
             self.cache.invalidate(key)
+            self.cache.invalidate("komga:inventory-pool")
         return self.cache.get_or_load(
             key,
             lambda: self.api.series(library_id, search=search, page_size=page_size),
-            ttl_seconds=300,
+            ttl_seconds=self.content_ttl_seconds,
         )
 
     def books(
@@ -53,17 +65,18 @@ class CachedKomgaService:
         )
         if force:
             self.cache.invalidate(key)
+            self.cache.invalidate("komga:inventory-pool")
         return self.cache.get_or_load(
             key,
             lambda: self.api.books(
-                library_id,
-                series_id,
+                library_id=library_id,
+                series_id=series_id,
                 search=search,
                 page_size=page_size,
                 direct_series_only=direct_series_only,
                 timeout=timeout,
             ),
-            ttl_seconds=300,
+            ttl_seconds=self.content_ttl_seconds,
         )
 
     def thumbnail_bytes(
@@ -78,11 +91,68 @@ class CachedKomgaService:
         return self.cache.get_or_load(
             key,
             lambda: self.api.thumbnail_bytes(target_type, target_id),
-            ttl_seconds=900,
+            ttl_seconds=self.thumbnail_ttl_seconds,
         )
+
+    def _cached_read(self, operation: str, arguments: dict[str, Any], loader: Any) -> Any:
+        key = "komga:" + operation + ":" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        # Callers may annotate a row (e.g. its parent title); never mutate the
+        # shared cache or another request's response in doing so.
+        return deepcopy(self.cache.get_or_load(key, loader, ttl_seconds=self.content_ttl_seconds))
+
+    def series_page(self, **kwargs: Any) -> dict[str, Any]:
+        return self._cached_read("series_page", kwargs, lambda: self.api.series_page(**kwargs))
+
+    def books_page(self, **kwargs: Any) -> dict[str, Any]:
+        return self._cached_read("books_page", kwargs, lambda: self.api.books_page(**kwargs))
+
+    def browse_series(self, series_id: str) -> dict[str, Any]:
+        """Short-lived display cache; write/preview guards still use get_series."""
+        return self._cached_read("series_detail", {"id": series_id}, lambda: self.api.get_series(series_id))
 
     def invalidate_content(self) -> None:
         self.cache.invalidate("komga:")
+
+    def book_inventory_snapshot(self, library_id: str) -> Any:
+        from .inventory_cache import BookInventorySnapshot
+
+        # Shared between per-request Web wrappers, isolated by connection via
+        # the existing outer cache. An invalidation discards the whole pool,
+        # including snapshots/views still being built by obsolete requests.
+        pool = self.cache.get_or_load("komga:inventory-pool", lambda: MemoryCache(max_entries=2),
+                                      ttl_seconds=86400)
+        return pool.get_or_load(
+            library_id,
+            # Read the underlying API directly: deriving a new snapshot from
+            # old cached rows would silently extend their freshness window.
+            lambda: BookInventorySnapshot.load(self.api, library_id),
+            ttl_seconds=self.content_ttl_seconds,
+        )
+
+    def update_series_metadata(self, series_id: str, metadata: dict[str, Any]) -> Any:
+        result = self.api.update_series_metadata(series_id, metadata)
+        self.invalidate_content()
+        return result
+
+    def update_book_metadata(self, book_id: str, metadata: dict[str, Any]) -> Any:
+        result = self.api.update_book_metadata(book_id, metadata)
+        self.invalidate_content()
+        return result
+
+    def update_books_metadata_batch(self, updates_by_book_id: dict[str, dict[str, Any]]) -> Any:
+        result = self.api.update_books_metadata_batch(updates_by_book_id)
+        self.invalidate_content()
+        return result
+
+    def add_thumbnail(self, target_type: str, target_id: str, file_path: str) -> Any:
+        result = self.api.add_thumbnail(target_type, target_id, file_path)
+        self.cache.invalidate(f"komga:thumbnail:{target_type}:{target_id}")
+        return result
+
+    def select_thumbnail(self, target_type: str, target_id: str, thumbnail_id: str) -> Any:
+        result = self.api.select_thumbnail(target_type, target_id, thumbnail_id)
+        self.cache.invalidate(f"komga:thumbnail:{target_type}:{target_id}")
+        return result
 
 
 class KoraSharedApiAdapter:

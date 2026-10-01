@@ -81,6 +81,8 @@ class SeriesGenreSuggestion:
     overflow_genres: tuple[str, ...]
     has_pending: bool
     over_limit: bool
+    nautiljon: dict | None = None
+    proposal_source: str = "komga"
 
     @property
     def changed(self) -> bool:
@@ -104,6 +106,8 @@ class SeriesGenreSuggestion:
             "has_pending": self.has_pending,
             "over_limit": self.over_limit,
             "changed": self.changed,
+            "nautiljon": self.nautiljon,
+            "proposal_source": self.proposal_source,
         }
 
 

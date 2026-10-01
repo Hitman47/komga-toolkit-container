@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -31,6 +32,12 @@ class KoraSuggestionDialog(QDialog):
     def __init__(self, suggestions: list[SeriesGenreSuggestion], parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Suggestions de genres Kora")
+        self.nautiljon_only = bool(suggestions) and all(s.proposal_source == "nautiljon" for s in suggestions)
+        self.combined = bool(suggestions) and all(s.proposal_source == "combined" for s in suggestions)
+        if self.nautiljon_only:
+            self.setWindowTitle("Suggestions de genres Kora — Nautiljon")
+        if self.combined:
+            self.setWindowTitle("Suggestions de genres Kora — locales + Nautiljon")
         self.resize(1450, 820)
         self.action: Literal["queue", "apply"] | None = None
         self.drafts = [
@@ -50,10 +57,14 @@ class KoraSuggestionDialog(QDialog):
             f"Les genres Kora existants sont conservés, avec un maximum de {MAX_KORA_GENRES}."
         )
         intro.setWordWrap(True)
+        if self.nautiljon_only:
+            intro.setText("Recherche dans le CSV Nautiljon complet, sans lien préalable. Les correspondances sûres sont proposées ; les genres Kora existants restent conservés. Maximum 5 au total.")
+        if self.combined:
+            intro.setText("Fusion des suggestions locales et Nautiljon, sans doublons. Les genres Kora existants sont conservés. Maximum 5 au total ; les autres propositions restent consultables.")
         root.addWidget(intro)
 
         splitter = QSplitter(Qt.Horizontal)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             [
                 "Appliquer",
@@ -63,9 +74,11 @@ class KoraSuggestionDialog(QDialog):
                 "Genres Kora actuels",
                 "Genres Kora proposés",
                 "État",
+                "Nautiljon (facultatif)",
             ]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(320)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self._load_selected_editor)
@@ -77,6 +90,10 @@ class KoraSuggestionDialog(QDialog):
         self.editor_title.setWordWrap(True)
         self.editor_title.setStyleSheet("font-weight: 700;")
         editor_layout.addWidget(self.editor_title)
+        self.nautiljon_label = QLabel("")
+        self.nautiljon_label.setWordWrap(True)
+        self.nautiljon_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        editor_layout.addWidget(self.nautiljon_label)
 
         genre_box = QGroupBox(f"Genres Kora proposés — maximum {MAX_KORA_GENRES}")
         genre_layout = QVBoxLayout(genre_box)
@@ -94,7 +111,10 @@ class KoraSuggestionDialog(QDialog):
         self.evidence_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         editor_layout.addWidget(self.evidence_label)
         editor_layout.addStretch(1)
-        splitter.addWidget(editor)
+        editor_scroll = QScrollArea()
+        editor_scroll.setWidgetResizable(True)
+        editor_scroll.setWidget(editor)
+        splitter.addWidget(editor_scroll)
         splitter.setSizes([1000, 420])
         root.addWidget(splitter, 1)
 
@@ -131,6 +151,7 @@ class KoraSuggestionDialog(QDialog):
                 readable_genres(suggestion.current_genres) or "Aucun",
                 readable_genres(draft["genres"]) or "Aucun",
                 self._status_text(row),
+                (suggestion.nautiljon or {}).get("status", "Non demandé"),
             ]
             for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(str(value))
@@ -143,6 +164,8 @@ class KoraSuggestionDialog(QDialog):
         self.table.setColumnWidth(4, 230)
         self.table.setColumnWidth(5, 260)
         self.table.setColumnWidth(6, 180)
+        self.table.setColumnWidth(7, 190)
+        self.table.setColumnHidden(7, not any(draft["suggestion"].nautiljon is not None for draft in self.drafts))
         if self.table.rowCount():
             self.table.selectRow(0)
         self._refresh_summary()
@@ -201,6 +224,20 @@ class KoraSuggestionDialog(QDialog):
             self.evidence_label.setText("Origine des propositions :\n" + "\n".join(candidate_lines))
         else:
             self.evidence_label.setText("Aucune correspondance fiable trouvée.")
+        extra = suggestion.nautiljon
+        self.nautiljon_label.setVisible(bool(extra))
+        for slug, checkbox in self.genre_checks.items():
+            checkbox.setText(genre_label(slug))
+        if extra:
+            lines = ["\nNautiljon — recherche CSV" if self.nautiljon_only or self.combined else "\nNautiljon — proposition supplémentaire (non cochée automatiquement)",
+                     str(extra.get("status", "")), str(extra.get("title", "")), str(extra.get("url", "")),
+                     str(extra.get("message", "")), str(extra.get("catalog_status", ""))]
+            for candidate in extra.get("candidates", []):
+                self.genre_checks[candidate["slug"]].setText(genre_label(candidate["slug"]) + " (+ Nautiljon)")
+                lines.append(genre_label(candidate["slug"]) + " : " + ", ".join(
+                    item["source"] + " « " + item["value"] + " »" for item in candidate["evidence"]))
+            lines.append("Coche les genres souhaités ci-dessous pour les ajouter. Maximum 5 au total.")
+            self.nautiljon_label.setText("\n".join(lines))
 
     def _on_genre_changed(self, slug: str) -> None:
         if self._loading_editor:
@@ -277,7 +314,7 @@ class KoraSuggestionDialog(QDialog):
                     suggestion.title,
                     genres,
                     source="genre-suggestion",
-                    note="genres Komga puis fallback tags",
+                    note="Fusion locale + Nautiljon CSV" if self.combined else "Nautiljon CSV" if self.nautiljon_only else "genres Komga puis fallback tags",
                 )
             )
         return changes

@@ -247,4 +247,10 @@ class LocalExclusionsStore:
         rows = list(records)
         if include_excluded:
             return rows
-        return [record for record in rows if not self.exclusion_reason(record)]
+        # Read one coherent snapshot, instead of reopening the file twice per row.
+        payload = self.load()
+        excluded = {str(key) for key in payload["excluded_series_ids"]}
+        rules = [rule for rule in payload["title_rules"] if isinstance(rule, dict)]
+        return [record for record in rows
+                if str(record.id or "") not in excluded
+                and not any(self._title_matches_rule(record.title, rule) for rule in rules)]

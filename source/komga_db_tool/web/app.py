@@ -1,4 +1,6 @@
 from __future__ import annotations
+from ..series_identity import assess_identity, identity_text, mapping, match_titles, search_aliases, search_queries
+from ..series_inventory import series_inventory_page, web_series_filter
 
 import hmac
 import os
@@ -44,7 +46,7 @@ from ..mangabaka import (
     ranked_mangabaka_choices,
     select_mangabaka_automatch,
 )
-from ..nautiljon import clean_nautiljon_query, select_nautiljon_automatch
+from ..nautiljon import clean_nautiljon_query, proposed_nautiljon_series_metadata, select_nautiljon_automatch
 from ..enrichment_history import EnrichmentHistoryStore, format_search_timestamp
 from ..cover_search import DuckDuckGoCoverSearchClient, download_cover_image
 from ..chapter_cleanup import analyze_chapter_series_item, scan_chapter_series
@@ -85,6 +87,10 @@ class ConnectionRequest(BaseModel):
     timeout: int = Field(default=30, ge=3, le=300)
 
 
+class FileSourceRequest(BaseModel):
+    path: str = Field(default="", max_length=4096)
+
+
 class SourceSettingsRequest(BaseModel):
     manga_news_url: str | None = Field(default=None, max_length=2048)
     manga_news_token: str | None = Field(default=None, max_length=4096)
@@ -101,10 +107,13 @@ class MetadataPreviewRequest(BaseModel):
     target_id: str = Field(min_length=1, max_length=256)
     payload: dict[str, Any]
     source: str = Field(default="webui", max_length=100)
+    identity_candidate: dict[str, Any] | None = None
+    identity_peers: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
 
 class TokenRequest(BaseModel):
     token: str = Field(min_length=1, max_length=128)
+    identity_confirmed: bool = False
 
 
 class ResourcePreviewRequest(BaseModel):
@@ -281,6 +290,7 @@ class MangaBakaAutomatchManualPreviewRequest(BaseModel):
 
 class MangaBakaAutomatchApplyRequest(BaseModel):
     tokens: list[str] = Field(min_length=1, max_length=500)
+    identity_confirmed: bool = False
 
 
 class NautiljonAutomatchPreviewRequest(BaseModel):
@@ -289,6 +299,7 @@ class NautiljonAutomatchPreviewRequest(BaseModel):
 
 class NautiljonAutomatchApplyRequest(BaseModel):
     tokens: list[str] = Field(min_length=1, max_length=500)
+    identity_confirmed: bool = False
 
 
 class BookExplorerAnalyzeRequest(BaseModel):
@@ -322,6 +333,8 @@ class KoraPendingRequest(BaseModel):
 
 class KoraSuggestionRequest(BaseModel):
     series_ids: list[str] = Field(min_length=1, max_length=1000)
+    include_nautiljon: bool = False
+    source: Literal["komga", "nautiljon", "combined"] = "komga"
 
 
 class KoraSuggestionChangeRequest(BaseModel):
@@ -473,6 +486,30 @@ def source_settings() -> dict:
     return session_store.public_sources()
 
 
+@app.get("/api/sources/files")
+def file_sources() -> list[dict]:
+    try:
+        return session_store.file_sources()
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/sources/files/{source}/test")
+def test_file_source(source: str, payload: FileSourceRequest) -> dict:
+    try:
+        return session_store.test_file(source, payload.path)
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
+@app.post("/api/sources/files/{source}/activate")
+def activate_file_source(source: str, payload: FileSourceRequest) -> dict:
+    try:
+        return session_store.test_file(source, payload.path, activate=True)
+    except Exception as exc:
+        raise domain_error(exc) from exc
+
+
 @app.put("/api/sources/settings")
 def update_source_settings(payload: SourceSettingsRequest) -> dict:
     try:
@@ -571,7 +608,9 @@ def mangacollec_matches(
     library_id: str = Query(default="", max_length=256),
 ) -> list[dict[str, Any]]:
     try:
-        rows = api_or_401().series(library_id=library_id or None, page_size=200)
+        api = api_or_401()
+        api.invalidate_content()
+        rows = api.series(library_id=library_id or None, page_size=200)
         return session_store.mangacollec_store().match_rows(rows)
     except HTTPException:
         raise
@@ -650,11 +689,15 @@ def libraries() -> list[dict]:
 def series(
     library_id: str = Query(default="", max_length=256),
     search: str = Query(default="", max_length=500),
+    refresh: bool = Query(default=False),
 ) -> list[dict]:
     try:
+        api = api_or_401()
+        if refresh:
+            api.invalidate_content()
         return [
             public_dataclass(row)
-            for row in api_or_401().series(library_id=library_id or None, search=search)
+            for row in api.series(library_id=library_id or None, search=search)
         ]
     except HTTPException:
         raise
@@ -680,6 +723,30 @@ def series_page(
             **result,
             "items": [public_dataclass(row) for row in result.get("items") or []],
         }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise safe_error(exc) from exc
+
+
+@app.get("/api/series-explorer")
+def series_explorer(
+    library_id: str = Query(default="", max_length=256),
+    search: str = Query(default="", max_length=500),
+    language: str = Query(default="", max_length=40),
+    status: str = Query(default="ALL", max_length=40),
+    link: str = Query(default="ALL", max_length=100),
+    empty_summary: bool = False, hide_chapters: bool = False, refresh: bool = False,
+    page: int = Query(default=0, ge=0), size: int = Query(default=100, ge=25, le=200),
+) -> dict:
+    try:
+        api = api_or_401()
+        if refresh:
+            api.invalidate_content()
+        result = series_inventory_page(api, library_id, search=search, page=page, size=size,
+            row_filter=web_series_filter(search=search, language=language, status=status, link=link,
+                                         empty_summary=empty_summary, hide_chapters=hide_chapters))
+        return {**result, "items": [public_dataclass(row) for row in result["items"]]}
     except HTTPException:
         raise
     except Exception as exc:
@@ -738,10 +805,13 @@ def search_books(
             if row.series_id and not row.series_title
         }
         if missing_series_ids:
+            from ..inventory import parent_series
+
             titles = {
-                str(row.id): str(row.title or "")
-                for row in api.series(library_id=library_id or None)
-                if str(row.id) in missing_series_ids
+                key: parent.title
+                for key, parent in parent_series(
+                    api, [row for row in items if row.series_id in missing_series_ids], library_id,
+                ).items()
             }
             for row in items:
                 if not row.series_title:
@@ -779,6 +849,9 @@ def book_explorer(
     hide_chapters: bool = Query(default=False),
     sort_field: Literal["added_at", "series_title", "title", "number", "release_date"] = "added_at",
     descending: bool = Query(default=True),
+    page: int = Query(default=0, ge=0),
+    size: int = Query(default=100, ge=25, le=500),
+    refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
         added_since = (
@@ -786,8 +859,11 @@ def book_explorer(
             if added_days
             else None
         )
+        api = api_or_401()
+        if refresh:
+            api.invalidate_content()
         return list_book_rows(
-            api_or_401(),
+            api,
             library_id,
             query=q,
             added_since=added_since,
@@ -799,6 +875,8 @@ def book_explorer(
             hide_chapter_series=hide_chapters,
             sort_field=sort_field,
             descending=descending,
+            page=page,
+            page_size=size,
         )
     except HTTPException:
         raise
@@ -839,6 +917,8 @@ def preview_metadata(payload: MetadataPreviewRequest) -> dict:
             payload.target_id,
             payload.payload,
             payload.source,
+            identity_candidate=payload.identity_candidate,
+            identity_peers=payload.identity_peers,
         )
     except HTTPException:
         raise
@@ -849,7 +929,7 @@ def preview_metadata(payload: MetadataPreviewRequest) -> dict:
 @app.post("/api/metadata/apply")
 def apply_metadata(payload: TokenRequest) -> dict:
     try:
-        return operations.apply_any(api_or_401(), payload.token)
+        return operations.apply_any(api_or_401(), payload.token, identity_confirmed=payload.identity_confirmed)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1082,18 +1162,12 @@ def search_source(
             q = mangabaka_search_title(q)
         _, edition_hint = split_manga_news_edition_title(q) if source == "manga_news" else (q, "")
         edition_mode = bool(source == "manga_news" and (editions or edition_hint))
+        target = api_or_401().get_series(series_id) if series_id else {"title": q}
         used_query = q
         if edition_mode:
             rows = session_store.manga_news_client().search_editions(q, limit=limit)
         else:
-            queries = (
-                build_conservative_search_queries(q, max_queries=3)
-                if source in {"manga_news", "comicvine", "metron"}
-                else build_search_queries(q)
-            )
-            rows = []
-            for candidate_query in queries or [q]:
-                used_query = candidate_query
+            def search(candidate_query):
                 if source == "bedetheque":
                     rows = session_store.bedetheque_client().search(candidate_query)
                 elif source == "nautiljon":
@@ -1106,20 +1180,16 @@ def search_source(
                     rows = session_store.metron_client().search(candidate_query, limit=limit)
                 else:
                     rows = session_store.comicvine_client().search(candidate_query, limit=limit)
-                if rows:
-                    break
+                return rows
+            found = search_aliases(q, target, search)
+            rows, used_query = found["rows"], found["used_query"]
         if series_id:
             ENRICHMENT_HISTORY.record_search(source, series_id, series_title or q)
         public_rows = [public_candidate(row) for row in rows]
-        if not edition_mode and source != "nautiljon":
+        if not edition_mode:
             for row in public_rows:
-                row["match_score"] = round(
-                    title_similarity(
-                        clean_title_for_search(q),
-                        clean_title_for_search(row.get("title") or ""),
-                    ),
-                    3,
-                )
+                row["match_score"] = match_titles(target, row)["score"]
+                row["identity"] = assess_identity(target, row, [other for other in public_rows if other is not row])
                 row["search_query_used"] = used_query
             public_rows.sort(
                 key=lambda row: (
@@ -1839,6 +1909,8 @@ def kora_inventory(
     genre: str = Query(default="", max_length=100),
     no_genre: bool = False,
     multiple_genres: bool = False,
+    hide_chapters: bool = False,
+    max_genres: int | None = Query(default=None, ge=0, le=MAX_KORA_GENRES),
 ) -> list[dict]:
     rows = KORA_CACHE.query_series(
         library_id=library_id,
@@ -1847,6 +1919,8 @@ def kora_inventory(
         no_genre=no_genre,
         multiple_genres=multiple_genres,
     )
+    from ..kora.inventory_filters import matches_inventory_filters
+    rows = [row for row in rows if matches_inventory_filters(row, hide_chapters=hide_chapters, max_genres=max_genres)]
     pending = KORA_CACHE.pending_genres_by_series_id()
     return [
         {
@@ -1879,7 +1953,20 @@ def kora_pending() -> list[dict]:
 
 @app.post("/api/kora/suggestions")
 def kora_suggestions(payload: KoraSuggestionRequest) -> dict:
+    from dataclasses import replace
     pending = KORA_CACHE.pending_genres_by_series_id()
+    from ..kora.nautiljon_suggestions import additional_nautiljon_suggestion
+    nautiljon_client = None
+    nautiljon_matcher = None
+    nautiljon_error = ""
+    if payload.include_nautiljon or payload.source in {"nautiljon", "combined"}:
+        try:
+            nautiljon_client = session_store.nautiljon_client()
+            from ..kora.nautiljon_matching import NautiljonGenreMatcher
+            nautiljon_matcher = NautiljonGenreMatcher(nautiljon_client)
+        except (OSError, RuntimeError, ValueError, csv.Error) as exc:
+            nautiljon_client = None
+            nautiljon_error = str(exc)
     rows: list[dict[str, object]] = []
     missing_ids: list[str] = []
     seen: set[str] = set()
@@ -1892,16 +1979,29 @@ def kora_suggestions(payload: KoraSuggestionRequest) -> dict:
             missing_ids.append(series_id)
             continue
         suggestion = suggest_series_genres(
-            record,
+            replace(record, genres=[], tags=[]) if payload.source == "nautiljon" else record,
             current_genres=pending.get(record.id, record.kora_genres),
             has_pending=record.id in pending,
         )
-        rows.append(suggestion.public())
+        if payload.source == "combined":
+            from ..kora.nautiljon_suggestions import merged_suggestion
+            suggestion = merged_suggestion(record, nautiljon_client, matcher=nautiljon_matcher, error=nautiljon_error,
+                current_genres=pending.get(record.id, record.kora_genres), has_pending=record.id in pending)
+        elif nautiljon_client is not None:
+            if payload.source == "nautiljon":
+                from ..kora.nautiljon_suggestions import nautiljon_only_suggestion
+                suggestion = nautiljon_only_suggestion(record, nautiljon_client, matcher=nautiljon_matcher, current_genres=pending.get(record.id, record.kora_genres), has_pending=record.id in pending)
+            else:
+                suggestion = additional_nautiljon_suggestion(suggestion, record, nautiljon_client, nautiljon_matcher)
+        public = suggestion.public()
+        if nautiljon_error:
+            public["nautiljon"] = {"status": "indisponible", "message": nautiljon_error, "candidates": []}
+        rows.append(public)
     return {
         "rows": rows,
         "missing_ids": missing_ids,
         "max_genres": MAX_KORA_GENRES,
-        "source_priority": ["genres_komga", "tags_komga"],
+        "source_priority": ["genres_komga", "tags_komga", "nautiljon"] if payload.source == "combined" else ["nautiljon"] if payload.source == "nautiljon" else ["genres_komga", "tags_komga"],
     }
 
 
@@ -2296,13 +2396,8 @@ def preview_mangabaka_automatch(payload: MangaBakaAutomatchPreviewRequest) -> di
                 row["komga_title"] = title
                 row["query"] = query
                 ENRICHMENT_HISTORY.record_search("mangabaka", series_id, title)
-                results = []
-                used_query = query
-                for candidate_query in build_search_queries(query):
-                    used_query = candidate_query
-                    results = client.search(candidate_query, limit=50)
-                    if results:
-                        break
+                found = search_aliases(query, current, lambda text: client.search(text, limit=50))
+                results, used_query = found["rows"], found["used_query"]
                 row["search_query_used"] = used_query
                 row["choices"] = [
                     {
@@ -2312,10 +2407,10 @@ def preview_mangabaka_automatch(payload: MangaBakaAutomatchPreviewRequest) -> di
                         "source_url": choice.source_url,
                         "match_score": round(choice_score, 6),
                     }
-                    for choice, choice_score in ranked_mangabaka_choices(query, results, limit=5)
+                    for choice, choice_score in ranked_mangabaka_choices(current, results, limit=5)
                 ]
                 matched, status, best, second, count = select_mangabaka_automatch(
-                    query,
+                    current,
                     results,
                     min_score=0.90,
                     min_margin=MANGABAKA_AUTOMATCH_MIN_MARGIN,
@@ -2325,7 +2420,13 @@ def preview_mangabaka_automatch(payload: MangaBakaAutomatchPreviewRequest) -> di
                     rows.append(row)
                     continue
                 candidate = client.get_series(matched.id)
-                loaded_score = mangabaka_match_score(query, candidate)
+                loaded_score = mangabaka_match_score(current, candidate)
+                identity = assess_identity(current, candidate, results)
+                row["identity"] = identity
+                if not identity["safe"]:
+                    row["status"] = identity_text(identity)
+                    rows.append(row)
+                    continue
                 row.update({
                     "matched_id": matched.id,
                     "matched_title": matched.title,
@@ -2343,7 +2444,7 @@ def preview_mangabaka_automatch(payload: MangaBakaAutomatchPreviewRequest) -> di
                     row["status"] = "OK : aucun changement"
                     rows.append(row)
                     continue
-                preview = operations.preview_metadata(api, "series", series_id, proposed, "auto_match_mangabaka_webui")
+                preview = operations.preview_metadata(api, "series", series_id, proposed, "auto_match_mangabaka_webui", identity_candidate=mapping(candidate))
                 row.update({"status": "Prêt", "token": preview["token"], "eligible": True, "diff": preview["diff"]})
             except Exception as exc:
                 row["status"] = "Erreur"
@@ -2385,6 +2486,7 @@ def preview_manual_mangabaka_automatch(payload: MangaBakaAutomatchManualPreviewR
             payload.series_id,
             proposed,
             "mangabaka_manual_automatch_webui",
+            identity_candidate=mapping(candidate),
         )
         return {**base, "status": "Choix manuel — prêt", **preview}
     except HTTPException:
@@ -2397,7 +2499,7 @@ def preview_manual_mangabaka_automatch(payload: MangaBakaAutomatchManualPreviewR
 def apply_mangabaka_automatch(payload: MangaBakaAutomatchApplyRequest) -> dict:
     try:
         api = api_or_401()
-        results = [operations.apply_metadata(api, token) for token in dict.fromkeys(payload.tokens)]
+        results = [operations.apply_metadata(api, token, identity_confirmed=payload.identity_confirmed) for token in dict.fromkeys(payload.tokens)]
         return {"applied": sum(1 for row in results if row.get("status") == "applied"), "results": results}
     except HTTPException:
         raise
@@ -2434,7 +2536,9 @@ def preview_nautiljon_automatch(payload: NautiljonAutomatchPreviewRequest) -> di
                 query = clean_nautiljon_query(title)
                 row.update({"komga_title": title, "query": query})
                 ENRICHMENT_HISTORY.record_search("nautiljon", series_id, title)
-                results = client.search(query, limit=50)
+                from dataclasses import replace
+                results = [replace(item, match_score=match_titles(current, item)["score"])
+                           for item in search_aliases(query, current, lambda text: client.search(text, limit=50))["rows"]]
                 matched, status, best, second = select_nautiljon_automatch(results)
                 row.update({
                     "status": status,
@@ -2456,6 +2560,12 @@ def preview_nautiljon_automatch(payload: NautiljonAutomatchPreviewRequest) -> di
                     rows.append(row)
                     continue
                 candidate = client.get_series(matched.url)
+                identity = assess_identity(current, candidate, results)
+                row["identity"] = identity
+                if not identity["safe"]:
+                    row["status"] = identity_text(identity)
+                    rows.append(row)
+                    continue
                 incoming_tags = list(candidate.series_metadata.get("tags") or [])
                 existing_keys = {str(value).strip().casefold() for value in current.get("tags") or []}
                 additions = [value for value in incoming_tags if str(value).strip().casefold() not in existing_keys]
@@ -2470,8 +2580,9 @@ def preview_nautiljon_automatch(payload: NautiljonAutomatchPreviewRequest) -> di
                     api,
                     "series",
                     series_id,
-                    candidate.series_metadata,
+                    proposed_nautiljon_series_metadata(current, candidate),
                     "nautiljon_automatch_webui",
+                    identity_candidate=mapping(candidate),
                 )
                 if not preview.get("changed_fields"):
                     row["status"] = "OK : aucun changement"
@@ -2493,7 +2604,7 @@ def preview_nautiljon_automatch(payload: NautiljonAutomatchPreviewRequest) -> di
 def apply_nautiljon_automatch(payload: NautiljonAutomatchApplyRequest) -> dict:
     try:
         api = api_or_401()
-        results = [operations.apply_metadata(api, token) for token in dict.fromkeys(payload.tokens)]
+        results = [operations.apply_metadata(api, token, identity_confirmed=payload.identity_confirmed) for token in dict.fromkeys(payload.tokens)]
         return {"applied": sum(1 for row in results if row.get("status") == "applied"), "results": results}
     except HTTPException:
         raise

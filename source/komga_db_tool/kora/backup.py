@@ -8,7 +8,7 @@ from typing import Any
 
 
 def _stamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 class BackupManager:
@@ -24,6 +24,12 @@ class BackupManager:
             json.dump(rows, f, ensure_ascii=False, indent=2, sort_keys=True)
         self._write_summary(csv_path, rows)
         return json_path, csv_path
+
+    def save_results_report(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.root / f"komga_kora_resultats_{_stamp()}.json"
+        with path.open("w", encoding="utf-8") as stream:
+            json.dump(rows, stream, ensure_ascii=False, indent=2)
+        return path
 
     def _write_summary(self, path: Path, rows: list[dict[str, Any]]) -> None:
         fieldnames = [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import os
+import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,10 @@ from ..mangacollec import MangaCollecStore
 from ..metron import DEFAULT_METRON_API_BASE_URL, MetronClient
 from ..nautiljon import NautiljonCsvClient
 from ..app_settings import MatchingConfig
+from ..integrations import CachedKomgaService
+from ..runtime import MemoryCache
+from ..file_sources import FILE_SOURCES, test_file_source
+from ..catalog_mirror import CatalogMirror
 
 
 def _request_delay_from_env(name: str, default: float) -> float:
@@ -37,6 +42,8 @@ class WebSessionStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._api: KomgaApi | None = None
+        self._komga_cache = MemoryCache(max_entries=128)
+        self._komga_cache_api: Any | None = None
         self._public: dict[str, Any] = {
             "connected": False,
             "base_url": "",
@@ -56,6 +63,13 @@ class WebSessionStore:
             configured_timeout = 30
         self._automatic_timeout = max(3, min(300, configured_timeout))
         data_dir = Path(os.getenv("KOMGA_TOOLKIT_DATA_DIR") or ".komga_db_tool_cache/web")
+        self._file_settings_path = data_dir / "file_sources.json"
+        try:
+            self._file_paths = json.loads(self._file_settings_path.read_text(encoding="utf-8"))
+            if not isinstance(self._file_paths, dict):
+                self._file_paths = {}
+        except (OSError, ValueError):
+            self._file_paths = {}
         self._mangacollec = MangaCollecStore(data_dir / "mangacollec")
         default_bedetheque_csv = data_dir / "uploads" / "bedetheque.csv"
         configured_bedetheque_csv = Path(
@@ -63,9 +77,7 @@ class WebSessionStore:
         )
         self._bedetheque_csv_storage_path = default_bedetheque_csv
         active_bedetheque_csv = (
-            default_bedetheque_csv
-            if default_bedetheque_csv.is_file()
-            else configured_bedetheque_csv
+            default_bedetheque_csv if default_bedetheque_csv.is_file() else configured_bedetheque_csv
         )
         default_nautiljon_csv = data_dir / "uploads" / "nautiljon.csv"
         configured_nautiljon_csv = Path(
@@ -73,9 +85,7 @@ class WebSessionStore:
         )
         self._nautiljon_csv_storage_path = default_nautiljon_csv
         active_nautiljon_csv = (
-            default_nautiljon_csv
-            if default_nautiljon_csv.is_file()
-            else configured_nautiljon_csv
+            default_nautiljon_csv if default_nautiljon_csv.is_file() else configured_nautiljon_csv
         )
         self._source_config: dict[str, Any] = {
             "manga_news_url": os.getenv("MANGA_NEWS_BASE_URL") or "http://host.docker.internal:8017",
@@ -85,8 +95,8 @@ class WebSessionStore:
             "comicvine_api_key": "",
             "metron_url": os.getenv("METRON_BASE_URL") or DEFAULT_METRON_API_BASE_URL,
             "metron_token": "",
-            "bedetheque_csv_path": str(active_bedetheque_csv),
-            "nautiljon_csv_path": str(active_nautiljon_csv),
+            "bedetheque_csv_path": str(self._file_paths.get("bedetheque") or active_bedetheque_csv),
+            "nautiljon_csv_path": str(self._file_paths.get("nautiljon") or active_nautiljon_csv),
             "timeout": 30,
             "cache_dir": str(data_dir / "cache"),
         }
@@ -149,7 +159,9 @@ class WebSessionStore:
         api = KomgaApi(base_url, auth=auth, timeout=timeout)
         message = api.test()
         with self._lock:
+            self._komga_cache.invalidate("komga:")
             self._api = api
+            self._komga_cache_api = api
             self._public = {
                 "connected": True,
                 "base_url": api.client.base_url,
@@ -160,7 +172,9 @@ class WebSessionStore:
 
     def disconnect(self) -> dict[str, Any]:
         with self._lock:
+            self._komga_cache.invalidate("komga:")
             self._api = None
+            self._komga_cache_api = None
             self._public = {
                 "connected": False,
                 "base_url": "",
@@ -225,7 +239,9 @@ class WebSessionStore:
         )
         message = api.test()
         with self._lock:
+            self._komga_cache.invalidate("komga:")
             self._api = api
+            self._komga_cache_api = api
             self._public = {
                 "connected": True,
                 "base_url": api.client.base_url,
@@ -235,14 +251,25 @@ class WebSessionStore:
             }
         return api
 
-    def require_api(self) -> KomgaApi:
+    def require_api(self) -> CachedKomgaService:
         with self._lock:
             api = self._api
-        if api is not None:
-            return api
-        if self._automatic_base_url:
-            return self._connect_automatically()
-        raise LookupError("Connexion Komga requise")
+        if api is None:
+            if not self._automatic_base_url:
+                raise LookupError("Connexion Komga requise")
+            api = self._connect_automatically()
+        with self._lock:
+            # Also protects development/test hot swaps and any future reconnect
+            # path that replaces the underlying client directly.
+            if self._komga_cache_api is not api:
+                self._komga_cache.invalidate("komga:")
+                self._komga_cache_api = api
+        return CachedKomgaService(
+            api,
+            self._komga_cache,
+            content_ttl_seconds=30,
+            thumbnail_ttl_seconds=300,
+        )
 
     def configure_sources(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {
@@ -270,13 +297,18 @@ class WebSessionStore:
         with self._lock:
             cfg = dict(self._source_config)
         bedetheque_csv_path = Path(str(cfg["bedetheque_csv_path"] or "")).expanduser()
-        bedetheque_csv_stat = (
-            bedetheque_csv_path.stat()
-            if bedetheque_csv_path.is_file()
-            else None
-        )
         nautiljon_csv_path = Path(str(cfg["nautiljon_csv_path"] or "")).expanduser()
-        nautiljon_csv_stat = nautiljon_csv_path.stat() if nautiljon_csv_path.is_file() else None
+        from ..catalog_mirror import CatalogMirror
+        def available_stat(path, kind):
+            try:
+                if path.is_file():
+                    return path.stat()
+            except OSError:
+                pass
+            local = CatalogMirror(str(path), kind).local
+            return local.stat() if local.is_file() else None
+        bedetheque_csv_stat = available_stat(bedetheque_csv_path, "bedetheque")
+        nautiljon_csv_stat = available_stat(nautiljon_csv_path, "nautiljon")
         return {
             "manga_news_url": cfg["manga_news_url"],
             "manga_news_token_configured": bool(cfg["manga_news_token"]),
@@ -323,6 +355,57 @@ class WebSessionStore:
         with self._lock:
             return asdict(self._matching)
 
+    def file_sources(self) -> list[dict]:
+        with self._lock:
+            cfg = dict(self._source_config)
+        result = []
+        for kind, label in FILE_SOURCES.items():
+            if kind == "mangacollec":
+                status = self._mangacollec.status()
+                result.append({"source": kind, "label": label, "path": status["source_path"],
+                    "filename": status["filename"], "configured": status["configured"],
+                    "status": status["source_status"], "entries": status.get("release_count", 0),
+                    "updated_at": datetime.fromtimestamp(status["updated_at"], timezone.utc).isoformat() if status["updated_at"] else ""})
+                continue
+            path = Path(cfg[f"{kind}_csv_path"]).expanduser()
+            mirror = CatalogMirror(str(path), kind).local
+            direct = path.is_file()
+            available = path if direct else mirror
+            stat = available.stat() if available.is_file() else None
+            result.append({"source": kind, "label": label, "path": str(path),
+                "filename": path.name, "configured": stat is not None,
+                "status": "Fichier disponible — à tester" if direct else "Copie locale de secours" if stat else "Fichier indisponible",
+                "size_bytes": stat.st_size if stat else 0,
+                "updated_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat() if stat else ""})
+        return result
+
+    def test_file(self, kind: str, path="", *, activate=False) -> dict:
+        if kind not in FILE_SOURCES:
+            raise ValueError("Source fichier inconnue")
+        with self._lock:
+            proposed = bool(path)
+            if not path:
+                path = (self._mangacollec.status()["source_path"] if kind == "mangacollec"
+                        else self._source_config[f"{kind}_csv_path"])
+            if kind == "mangacollec" and not path and not activate:
+                status = self._mangacollec.status()
+                if not status["configured"]:
+                    raise ValueError("Importez un catalogue MangaCollec")
+                return {"source": kind, "status": status["source_status"],
+                        "validation": f"{status.get('release_count', 0)} sortie(s) dans le catalogue importé"}
+            result = test_file_source(kind, path, fallback=not activate and not proposed,
+                                      mangacollec_store=self._mangacollec)
+            if activate:
+                if kind == "mangacollec":
+                    self._mangacollec.import_file(path)
+                else:
+                    test_file_source(kind, path, fallback=True)
+                    candidate = {**self._file_paths, kind: str(Path(path).expanduser().resolve())}
+                    MangaCollecStore._atomic_json(self._file_settings_path, candidate)
+                    self._file_paths = candidate
+                    self._source_config[f"{kind}_csv_path"] = candidate[kind]
+            return result
+
     def configure_matching(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = MatchingConfig.__dataclass_fields__
         with self._lock:
@@ -355,7 +438,8 @@ class WebSessionStore:
         with self._lock:
             csv_path = str(self._source_config["bedetheque_csv_path"] or "").strip()
         path = Path(csv_path).expanduser() if csv_path else None
-        if path is None or not path.is_file():
+        from ..catalog_mirror import CatalogMirror
+        if path is None or not (CatalogMirror(str(path), "bedetheque").local.is_file() or path.is_file()):
             raise RuntimeError(
                 "Automatisation Bedetheque indisponible : chargez d'abord "
                 "un CSV Bedetheque dans les paramètres WebUI."
@@ -373,12 +457,14 @@ class WebSessionStore:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
-                validation = BedethequeCsvClient(str(temporary)).test()
+                validation = BedethequeCsvClient(str(temporary), mirror=False).test()
                 temporary.replace(path)
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
             self._source_config["bedetheque_csv_path"] = str(path)
+            self._file_paths["bedetheque"] = str(path)
+            MangaCollecStore._atomic_json(self._file_settings_path, self._file_paths)
             result = self.public_sources()
             result["bedetheque_csv_validation"] = validation
             return result
@@ -388,7 +474,8 @@ class WebSessionStore:
         with self._lock:
             csv_path = str(self._source_config["nautiljon_csv_path"] or "").strip()
         path = Path(csv_path).expanduser() if csv_path else None
-        if path is None or not path.is_file():
+        from ..catalog_mirror import CatalogMirror
+        if path is None or not (CatalogMirror(str(path), "nautiljon").local.is_file() or path.is_file()):
             raise RuntimeError(
                 "Enrichissement Nautiljon indisponible : chargez d'abord "
                 "un CSV Nautiljon dans les paramètres WebUI."
@@ -406,12 +493,14 @@ class WebSessionStore:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
-                validation = NautiljonCsvClient(str(temporary)).test()
+                validation = NautiljonCsvClient(str(temporary), mirror=False).test()
                 temporary.replace(path)
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
             self._source_config["nautiljon_csv_path"] = str(path)
+            self._file_paths["nautiljon"] = str(path)
+            MangaCollecStore._atomic_json(self._file_settings_path, self._file_paths)
             result = self.public_sources()
             result["nautiljon_csv_validation"] = validation
             return result

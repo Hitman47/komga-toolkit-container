@@ -7,7 +7,9 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
 
+from .author_cleanup import author_entries, author_fold_key
 from .bedetheque import _fold, title_similarity
+from .catalog_mirror import CatalogMirror
 
 
 REQUIRED_COLUMNS = {"url_fiche", "titre", "genres", "themes"}
@@ -15,6 +17,111 @@ NAUTILJON_LINK_LABEL = "Nautiljon"
 AUTOMATCH_MIN_SCORE = 0.90
 AUTOMATCH_MIN_MARGIN = 0.05
 _CHAPTER_SUFFIX = re.compile(r"\s*\(\s*chap\s*\)\s*$", re.IGNORECASE)
+_VOLUME_DETAIL = re.compile(r"^\s*(\d+)\s*(?:\(([^)]*)\))?\s*$")
+
+
+def _csv_value(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.casefold() in {"n/a", "na", "non renseigné", "non renseigne", "-"} else text
+
+
+def _vf_status(value: Any) -> str:
+    folded = _fold(_csv_value(value)).strip()
+    return {
+        "termine": "ENDED",
+        "en cours": "ONGOING",
+        "abandonne": "ABANDONED",
+        "en pause": "HIATUS",
+        "en attente": "HIATUS",
+    }.get(folded, "")
+
+
+def nautiljon_vf_metadata(row: dict[str, str]) -> tuple[dict[str, Any], list[str]]:
+    """Only publish VF release facts that are internally consistent.
+
+    A published-volume count is not a final total while publication is ongoing.
+    VO figures and zero-valued VF list entries are never substituted for VF data.
+    """
+    metadata: dict[str, Any] = {}
+    warnings: list[str] = []
+    detail = _csv_value(row.get("nb_vol_vf_detail"))
+    match = _VOLUME_DETAIL.fullmatch(detail) if detail else None
+    detail_count = int(match.group(1)) if match else None
+    detail_status = _vf_status(match.group(2)) if match else ""
+    list_text = _csv_value(row.get("nb_vol_vf_liste"))
+    list_count = int(list_text) if list_text.isdecimal() else None
+    explicit_statuses = [
+        _vf_status(row.get(key)) for key in ("statut_vf", "statut_vf_liste")
+    ]
+    statuses = {value for value in [detail_status, *explicit_statuses] if value}
+    if len(statuses) > 1:
+        warnings.append("Statuts VF contradictoires dans le CSV : statut et total ignorés.")
+        return metadata, warnings
+    if detail_count is not None and list_count is not None and detail_count != list_count:
+        warnings.append("Nombres de tomes VF contradictoires dans le CSV : total ignoré.")
+        detail_count = None
+    status = next(iter(statuses), "")
+    if status:
+        metadata["status"] = status
+    if status == "ENDED":
+        final_count = detail_count if detail_count is not None else list_count
+        if final_count is not None and final_count > 0 and (detail_count is not None or list_count is not None):
+            # A list count of zero is a known scraper failure, not a confirmed total.
+            if not any("contradictoires" in warning for warning in warnings):
+                metadata["totalBookCount"] = final_count
+    return metadata, warnings
+
+
+def nautiljon_credited_authors(row: dict[str, str]) -> list[dict[str, str]]:
+    """Expose source credits without assuming that they belong to every Komga book."""
+    authors: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for column, role in (("scenariste", "writer"), ("dessinateur", "penciller")):
+        name = _csv_value(row.get(column))
+        key = (name.casefold(), role)
+        if name and key not in seen:
+            authors.append({"name": name, "role": role})
+            seen.add(key)
+    return authors
+
+
+def merge_nautiljon_authors(existing: Any, incoming: Any) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Append only genuinely missing name/role credits; preserve book authors.
+
+    Two-part names with reversed order or accent/case differences count as the
+    same person for this comparison. Existing spellings and roles are untouched.
+    """
+    current = author_entries(existing)
+    merged = list(current)
+    added: list[dict[str, str]] = []
+
+    def identity(entry: dict[str, str]) -> tuple[tuple[str, ...], str]:
+        parts = tuple(author_fold_key(entry["name"]).split())
+        return (tuple(sorted(parts)) if len(parts) == 2 else parts, entry["role"].casefold())
+
+    seen = {identity(entry) for entry in current}
+    for entry in author_entries(incoming):
+        key = identity(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+        added.append(entry)
+    return merged, added
+
+
+def proposed_nautiljon_series_metadata(current: dict[str, Any], candidate: "NautiljonCandidate") -> dict[str, Any]:
+    proposed = {
+        "tags": merge_nautiljon_tags(current.get("tags"), candidate.series_metadata.get("tags") or []),
+        "links": merge_nautiljon_links(current.get("links"), candidate.source_url),
+    }
+    # VF publication information must not overwrite an English/Japanese edition.
+    language = str(current.get("language") or "").strip().casefold()
+    if language in {"", "fr", "fra", "fr-fr"}:
+        for field in ("status", "totalBookCount"):
+            if field in candidate.series_metadata:
+                proposed[field] = candidate.series_metadata[field]
+    return proposed
 
 
 def clean_nautiljon_query(value: Any) -> str:
@@ -100,11 +207,15 @@ class NautiljonCsvClient:
     _cache_lock = RLock()
     _cache: dict[str, tuple[tuple[int, int], list[dict[str, str]]]] = {}
 
-    def __init__(self, csv_path: str):
+    def __init__(self, csv_path: str, *, mirror: bool = True):
         self.csv_path = str(Path(csv_path).expanduser())
+        self.catalog_mirror = CatalogMirror(csv_path, "nautiljon") if mirror else None
 
     def _rows(self) -> list[dict[str, str]]:
-        path = Path(self.csv_path)
+        path = self.catalog_mirror.resolve(self._read_rows) if self.catalog_mirror else Path(self.csv_path)
+        return self._read_rows(path)
+
+    def _read_rows(self, path: Path) -> list[dict[str, str]]:
         if not path.is_file():
             raise FileNotFoundError(f"CSV Nautiljon introuvable : {path}")
         stat = path.stat()
@@ -115,7 +226,7 @@ class NautiljonCsvClient:
             if cached and cached[0] == stamp:
                 return cached[1]
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            reader = csv.DictReader(stream, delimiter=";")
+            reader = csv.DictReader(stream, delimiter=";", strict=True)
             columns = {str(name or "").strip() for name in (reader.fieldnames or [])}
             missing = sorted(REQUIRED_COLUMNS - columns)
             if missing:
@@ -123,9 +234,12 @@ class NautiljonCsvClient:
                     "CSV Nautiljon invalide : colonne(s) obligatoire(s) absente(s) : "
                     + ", ".join(missing)
                 )
+            raw_rows = list(reader)
+            if any(None in row or any(value is None for value in row.values()) for row in raw_rows):
+                raise ValueError("CSV Nautiljon incomplet : nombre de colonnes incohérent")
             rows = [
                 {str(name): str(value or "") for name, value in row.items()}
-                for row in reader
+                for row in raw_rows
                 if str(row.get("titre") or "").strip() and str(row.get("url_fiche") or "").strip()
             ]
         if not rows:
@@ -135,7 +249,9 @@ class NautiljonCsvClient:
         return rows
 
     def test(self) -> str:
-        return f"CSV Nautiljon : {len(self._rows())} série(s)"
+        if self.catalog_mirror:
+            self.catalog_mirror.resolve(self._read_rows, refresh=True)
+        return f"CSV Nautiljon : {len(self._rows())} série(s) — {self.catalog_mirror.status if self.catalog_mirror else 'fichier validé'}"
 
     @staticmethod
     def _title_values(row: dict[str, str]) -> list[str]:
@@ -197,6 +313,8 @@ class NautiljonCsvClient:
         genres = split_nautiljon_taxonomy(row.get("genres"))
         themes = split_nautiljon_taxonomy(row.get("themes"))
         tags = merge_nautiljon_tags([], [*genres, *themes])
+        vf_metadata, release_warnings = nautiljon_vf_metadata(row)
+        authors = nautiljon_credited_authors(row)
         source_url = row.get("url_fiche", "").strip()
         return NautiljonCandidate(
             source_url=source_url,
@@ -204,12 +322,15 @@ class NautiljonCsvClient:
             series_metadata={
                 "tags": tags,
                 "links": [{"label": NAUTILJON_LINK_LABEL, "url": source_url}],
+                **vf_metadata,
             },
             raw={
                 "source": "nautiljon_csv",
                 "csv_row": row,
                 "genres": genres,
                 "themes": themes,
+                "authors": authors,
+                "release_warnings": release_warnings,
             },
         )
 

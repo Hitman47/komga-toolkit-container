@@ -15,7 +15,9 @@ from ..book_explorer import (
     sort_book_rows,
 )
 from ..manga_news import manga_news_edition_label_from_url, series_slug_from_manga_news_url
+from ..inventory import inventory_page, selected_books
 from ..source_books import SourceBookRow, match_source_books, resolved_book_volume_number
+from ..book_match_safety import assess_manga_news_book_match
 
 
 def public_book_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -40,31 +42,16 @@ def list_book_rows(
     hide_chapter_series: bool = False,
     sort_field: str = "added_at",
     descending: bool = True,
+    page: int = 0,
+    page_size: int = 100,
 ) -> dict[str, Any]:
-    series_rows = api.series(library_id=library_id, page_size=500)
-    books = api.books(library_id=library_id, page_size=500)
-    series_by_id = {str(row.id): row for row in series_rows}
-    rows = [
-        book_explorer_row(book, series_by_id.get(str(getattr(book, "series_id", "") or "")))
-        for book in books
-    ]
-    filtered = filter_book_rows(
-        rows,
-        query=query,
-        added_since=added_since,
-        language=language,
-        series_status=series_status,
-        source_filter=source_filter,
-        missing_field=missing_field,
-        empty_summary=empty_summary,
-        hide_chapter_series=hide_chapter_series,
+    result = inventory_page(
+        api, library_id, query=query, added_since=added_since, language=language,
+        series_status=series_status, source_filter=source_filter, missing_field=missing_field,
+        empty_summary=empty_summary, hide_chapter_series=hide_chapter_series,
+        sort_field=sort_field, descending=descending, page=page, page_size=page_size,
     )
-    sorted_rows = sort_book_rows(filtered, sort_field, descending)
-    return {
-        "total": len(rows),
-        "hidden": len(rows) - len(sorted_rows),
-        "rows": [public_book_row(row) for row in sorted_rows],
-    }
+    return {**result, "rows": [public_book_row(row) for row in result["rows"]]}
 
 
 def _comicvine_volume_id(url: str) -> str:
@@ -148,23 +135,24 @@ def _analyze_manga_news(
                     requested_number,
                     edition_label=edition_label,
                 )
-                exact = requested_number == normalize_volume_number(candidate.number)
             else:
                 candidate = client.get_volume_without_number(
                     slug,
                     row.get("title", "") or row.get("series_title", ""),
                     edition_label=edition_label,
                 )
-                exact = True
+            confidence, score, mismatch = assess_manga_news_book_match(row, candidate, requested_number, slug)
             results.append(
                 _analysis_row(
                     row,
                     source="manga_news",
                     source_ref=candidate.source_url,
                     matched_title=candidate.title,
-                    confidence="high" if exact else "ambiguous",
-                    score=1.0 if exact else title_similarity(row.get("title", ""), candidate.title),
-                    candidate=candidate.book_metadata,
+                    confidence=confidence,
+                    score=score,
+                    candidate=candidate.book_metadata if confidence else None,
+                    status="Source incohérente — non applicable" if not confidence else "",
+                    error=mismatch,
                 )
             )
         except Exception as exc:
@@ -284,14 +272,10 @@ def analyze_book_rows(
     cancelled: Callable[[], bool],
     record_search: Callable[[str, str, str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    series_rows = api.series(library_id=library_id, page_size=500)
-    books = api.books(library_id=library_id, page_size=500)
-    series_by_id = {str(row.id): row for row in series_rows}
-    selected_ids = {str(value) for value in book_ids}
+    books, series_by_id = selected_books(api, library_id, book_ids, cancelled)
     selected = [
         book_explorer_row(book, series_by_id.get(str(getattr(book, "series_id", "") or "")))
         for book in books
-        if str(getattr(book, "id", "") or "") in selected_ids
     ]
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in selected:

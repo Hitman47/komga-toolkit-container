@@ -55,11 +55,16 @@ class BedethequeCsvClient:
     _cache_lock = RLock()
     _cache: dict[str, tuple[tuple[int, int], list[dict[str, str]]]] = {}
 
-    def __init__(self, csv_path: str):
+    def __init__(self, csv_path: str, *, mirror: bool = True):
+        from .catalog_mirror import CatalogMirror
         self.csv_path = str(Path(csv_path).expanduser())
+        self.catalog_mirror = CatalogMirror(csv_path, "bedetheque") if mirror else None
 
     def _rows(self) -> list[dict[str, str]]:
-        path = Path(self.csv_path)
+        path = self.catalog_mirror.resolve(self._read_rows) if self.catalog_mirror else Path(self.csv_path)
+        return self._read_rows(path)
+
+    def _read_rows(self, path: Path) -> list[dict[str, str]]:
         if not path.is_file():
             raise FileNotFoundError(f"CSV Bedetheque introuvable : {path}")
         stat = path.stat()
@@ -70,7 +75,7 @@ class BedethequeCsvClient:
             if cached and cached[0] == stamp:
                 return cached[1]
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            reader = csv.DictReader(stream, delimiter=";")
+            reader = csv.DictReader(stream, delimiter=";", strict=True)
             columns = {str(name or "").strip() for name in (reader.fieldnames or [])}
             missing = sorted(REQUIRED_COLUMNS - columns)
             if missing:
@@ -78,9 +83,12 @@ class BedethequeCsvClient:
                     "CSV Bedetheque invalide : colonne(s) obligatoire(s) absente(s) : "
                     + ", ".join(missing)
                 )
+            raw_rows = list(reader)
+            if any(None in row or any(value is None for value in row.values()) for row in raw_rows):
+                raise ValueError("CSV Bedetheque incomplet : nombre de colonnes incohérent")
             rows = [
                 {str(key): str(value or "") for key, value in row.items()}
-                for row in reader
+                for row in raw_rows
             ]
         if not rows:
             raise ValueError("CSV Bedetheque invalide : aucune série disponible")
@@ -93,7 +101,7 @@ class BedethequeCsvClient:
         return rows
 
     def test(self) -> str:
-        return f"CSV Bedetheque : {len(self._rows())} série(s)"
+        return f"CSV Bedetheque : {len(self._rows())} série(s) — {self.catalog_mirror.status if self.catalog_mirror else 'fichier validé'}"
 
     def language_for_url(self, url: str) -> str:
         """Return the normalized edition language for one exact CSV URL."""

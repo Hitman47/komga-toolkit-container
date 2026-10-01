@@ -394,7 +394,7 @@ def filter_book_rows(
 ) -> list[dict[str, Any]]:
     needle = _fold(query)
     language_folded = _fold(language)
-    status_folded = _fold(series_status)
+    status_folded = _fold(series_status).replace("_", " ")
     source_filter = _text(source_filter).casefold() or "all"
     missing_field = _text(missing_field)
     out: list[dict[str, Any]] = []

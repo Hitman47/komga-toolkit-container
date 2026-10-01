@@ -1,0 +1,54 @@
+services:
+  komga-toolkit:
+    image: "${KOMGA_TOOLKIT_IMAGE:-ghcr.io/hitman47/komga-toolkit-container:desktop-v2}"
+    pull_policy: always
+    container_name: komga-toolkit-web
+    labels:
+      io.komga-toolkit.reference: desktop-v3.12.0rc52-20261001
+      io.komga-toolkit.interface: webui
+    restart: unless-stopped
+    ports:
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-8765}:8000"
+    environment:
+      KOMGA_TOOLKIT_DATA_DIR: /data
+      KOMGA_BASE_URL: "${KOMGA_BASE_URL:-}"
+      KOMGA_API_KEY: "${KOMGA_API_KEY:-}"
+      KOMGA_API_KEY_FILE: "${KOMGA_API_KEY_FILE:-}"
+      KOMGA_TIMEOUT: "${KOMGA_TIMEOUT:-30}"
+      KOMGA_TOOLKIT_AUTOMATION_TOKEN: "${KOMGA_TOOLKIT_AUTOMATION_TOKEN:-}"
+      KOMGA_TOOLKIT_AUTOMATION_TOKEN_FILE: "${KOMGA_TOOLKIT_AUTOMATION_TOKEN_FILE:-}"
+      KOMGA_TOOLKIT_REFERENCE: desktop-v3.12.0rc52-20261001
+      MANGA_NEWS_BASE_URL: "${MANGA_NEWS_BASE_URL:-http://host.docker.internal:8017}"
+      COMICVINE_BASE_URL: "${COMICVINE_BASE_URL:-https://comicvine.gamespot.com/api}"
+      COMICVINE_API_KEY: "${COMICVINE_API_KEY:-}"
+      COMICVINE_API_KEY_FILE: "${COMICVINE_API_KEY_FILE:-}"
+      METRON_BASE_URL: "${METRON_BASE_URL:-https://metron.cloud/api}"
+      METRON_API_TOKEN: "${METRON_API_TOKEN:-}"
+      METRON_API_TOKEN_FILE: "${METRON_API_TOKEN_FILE:-}"
+      BEDETHEQUE_CSV_PATH: "${BEDETHEQUE_CSV_PATH:-/data/uploads/bedetheque.csv}"
+      MANGA_NEWS_AUTOMATION_DELAY_SECONDS: "${MANGA_NEWS_AUTOMATION_DELAY_SECONDS:-1.0}"
+      MANGABAKA_AUTOMATION_DELAY_SECONDS: "${MANGABAKA_AUTOMATION_DELAY_SECONDS:-1.0}"
+      COMICVINE_AUTOMATION_DELAY_SECONDS: "${COMICVINE_AUTOMATION_DELAY_SECONDS:-1.2}"
+      METRON_AUTOMATION_DELAY_SECONDS: "${METRON_AUTOMATION_DELAY_SECONDS:-3.1}"
+      WEB_ALLOWED_HOSTS: "${WEB_ALLOWED_HOSTS:-localhost,127.0.0.1,192.168.1.30}"
+    volumes:
+      - komga_toolkit_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; payload=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)); assert payload.get('reference') == 'desktop-v3.12.0rc52-20261001'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  komga_toolkit_data:
+    name: komga_toolkit_data

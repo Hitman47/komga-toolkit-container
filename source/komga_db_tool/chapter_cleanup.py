@@ -102,6 +102,8 @@ def is_series_enrichment_source(source: Any) -> bool:
             "manga_news",
             "manganews",
             "comicvine",
+            "metron",
+            "nautiljon",
             "komf",
             "auto_match",
             "update_with_link",

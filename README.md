@@ -1,7 +1,7 @@
 # Komga Toolkit WebUI container
 
 Public container releases for the Komga Toolkit WebUI reference
-`desktop-v3.12.0rc24-20260831`.
+`desktop-v3.12.0rc52-20261001` (Web API and bundle `2.52.0`).
 
 The image is intended for Docker Compose and Portainer deployments:
 
@@ -9,15 +9,29 @@ The image is intended for Docker Compose and Portainer deployments:
 ghcr.io/hitman47/komga-toolkit-container:desktop-v2
 ```
 
-La publication est reconstruite automatiquement depuis le snapshot rc24 validé
-par la suite complète de non-régression, conservé dans `source/`.
+La publication est reconstruite par GitHub Actions depuis le snapshot rc52
+conservé dans `source/`. Docker Desktop n'est pas nécessaire à la construction.
+Avant publication, le conteneur est démarré sans données utilisateur, avec un
+système de fichiers en lecture seule : santé, référence et bundle Web doivent
+répondre et annoncer la même version. Un échec empêche la publication.
 Ce snapshot ne contient que le Dockerfile, les roues/dépendances Docker et le
 code applicatif nécessaire à l’image. Il ne contient ni configuration locale,
 ni identifiant, ni exécutable Desktop.
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés, par exemple `2.24.0-desktop-v2`, restent disponibles
+validée. Les tags versionnés `2.52.0` et `2.52.0-desktop-v2` restent disponibles
 pour revenir à une version antérieure.
+
+Pour Portainer, utilisez `docker-compose.portainer.yml` ou remplacez l'image
+du stack existant par `ghcr.io/hitman47/komga-toolkit-container:2.52.0`, puis
+recréez le service en conservant son volume `/data`. La publication d'une image
+ne met pas à jour automatiquement les conteneurs déjà déployés.
+
+Cette version inclut les catalogues de secours, les fichiers sources centralisés,
+le rafraîchissement explicite des inventaires et le choix de 500 lignes pour les
+écrans de sorties. Le nouveau thème rc52 reste propre à l'application Desktop.
+
+## Historique des versions précédentes
 
 Les routes d'automatisation Bedetheque utilisent exclusivement le CSV persistant
 `/data/uploads/bedetheque.csv`. Elles ne contactent jamais le site Bedetheque et

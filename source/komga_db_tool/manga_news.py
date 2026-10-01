@@ -1403,12 +1403,67 @@ class MangaNewsClient:
         edition = _safe_str(edition_label)
         if edition:
             query["edition_label"] = edition
+        path = f"/volume/{parse.quote(series_id, safe='')}/number/{parse.quote(volume_number, safe='')}"
         payload = self._get_json(
-            f"/volume/{parse.quote(series_id, safe='')}/number/{parse.quote(volume_number, safe='')}",
+            path,
             query=query,
             ttl_seconds=LOOKUP_CACHE_TTL_SECONDS,
         )
-        return candidate_from_volume(payload, series_id, volume_number)
+        candidate = candidate_from_volume(payload, series_id, volume_number)
+        source_slug = series_slug_from_manga_news_url(candidate.source_url)
+        if source_slug and self._base_volume_series_slug(source_slug) != self._base_volume_series_slug(series_id):
+            # Old Toolkit caches can retain the API's former sidebar-volume
+            # response. The edition-groups route already scopes volume cards.
+            scoped = self._get_scoped_volume_by_number(series_id, volume_number, edition)
+            if scoped is not None:
+                return scoped
+            payload = self._get_json(path, query=query, ttl_seconds=LOOKUP_CACHE_TTL_SECONDS, cache=False)
+            candidate = candidate_from_volume(payload, series_id, volume_number)
+            source_slug = series_slug_from_manga_news_url(candidate.source_url)
+            if source_slug and self._base_volume_series_slug(source_slug) != self._base_volume_series_slug(series_id):
+                raise LookupError(f"Volume Manga News hors série : {source_slug} (attendu : {series_id})")
+        return candidate
+
+    @staticmethod
+    def _base_volume_series_slug(value: str) -> str:
+        folded = _fold_edition_text(value)
+        return re.sub(r" (?:edition originale|edition perfect|perfect edition|integrale|collector|deluxe)$", "", folded)
+
+    def _get_scoped_volume_by_number(
+        self, series_slug: str, number: str, edition_label: str,
+    ) -> Optional[MangaNewsVolumeCandidate]:
+        try:
+            payload = self._get_json(
+                f"/series/{parse.quote(series_slug, safe='')}/edition-groups",
+                query={"include_volumes": "true"},
+                ttl_seconds=LOOKUP_CACHE_TTL_SECONDS,
+            )
+            groups = _series_data(payload).get("groups") or []
+            wanted_edition = _edition_match_key(edition_label) if edition_label else "originale"
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                group_label = _edition_match_key(group.get("edition_label"))
+                items = [item for item in (group.get("items") or []) if isinstance(item, dict)]
+                sole_unnumbered = number == "1" and len(groups) == 1 and len(items) == 1 and not items[0].get("number_int")
+                if group_label != wanted_edition and (edition_label or not sole_unnumbered):
+                    continue
+                selected = [item for item in items if _safe_str(item.get("number_int")) == number]
+                if sole_unnumbered and not selected:
+                    selected = items
+                for item in selected:
+                    url = _safe_str(item.get("url"))
+                    item_slug = series_slug_from_manga_news_url(url)
+                    if not url or self._base_volume_series_slug(item_slug) != self._base_volume_series_slug(series_slug):
+                        continue
+                    candidate = self.get_volume_by_url(url)
+                    if not candidate.number and number == "1" and len(items) == 1:
+                        candidate.number = "1"
+                        candidate.raw["_number_inferred_from_single_volume"] = True
+                    return candidate
+        except Exception:
+            return None
+        return None
 
     def get_volume_without_number(
         self,

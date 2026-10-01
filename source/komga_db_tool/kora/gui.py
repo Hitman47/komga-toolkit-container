@@ -45,6 +45,7 @@ from .models import PendingChange, SeriesRecord
 from .operations import apply_pending_changes
 from .suggestion_dialog import KoraSuggestionDialog
 from .suggestions import suggest_genre_for_value, suggest_series_genres
+from .inventory_filters import matches_inventory_filters
 from .tag_logic import genre_label, merge_series_tags_for_genres, normalize_slug, readable_genres, validate_genres
 from ..qt_tasks import Worker
 from ..runtime import SecretRedactor
@@ -58,12 +59,14 @@ class MainWindow(QMainWindow):
         connection_check: Callable[[], tuple[bool, str]] | None = None,
         exclusions_changed: Callable[[], None] | None = None,
         parent: QWidget | None = None,
+        nautiljon_provider: Callable | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1650, 950)
 
         self.api_provider = api_provider
+        self.nautiljon_provider = nautiljon_provider
         self.connection_check = connection_check
         self.exclusions_changed = exclusions_changed
         self.config = AppConfig.default()
@@ -71,6 +74,7 @@ class MainWindow(QMainWindow):
         self.backup = BackupManager(self.config.backup_dir)
         self.thread_pool = QThreadPool.globalInstance()
         self.active_workers: set[Worker] = set()
+        self._kora_suggestions_busy = False
         self.current_rows: list[SeriesRecord] = []
         self.current_record: SeriesRecord | None = None
         self._pending_genres_by_series_id: dict[str, list[str]] | None = None
@@ -336,6 +340,20 @@ class MainWindow(QMainWindow):
         filter_layout.addRow(self.has_kora_check)
         filter_layout.addRow(self.no_kora_check)
         filter_layout.addRow(self.multi_genre_check)
+        self.hide_chapters_check = QCheckBox("Masquer les séries (Chap)")
+        self.hide_chapters_check.stateChanged.connect(self.refresh_series_table)
+        filter_layout.addRow(self.hide_chapters_check)
+        self.genre_count_check = QCheckBox("Nombre de genres Kora ≤")
+        self.genre_count_combo = QComboBox()
+        for count in range(MAX_KORA_GENRES + 1):
+            self.genre_count_combo.addItem(str(count), count)
+        self.genre_count_combo.setCurrentIndex(1)
+        self.genre_count_combo.setEnabled(False)
+        self.genre_count_combo.setToolTip("Genres actuellement affectés dans Komga, sans les propositions en attente.")
+        self.genre_count_check.toggled.connect(self.genre_count_combo.setEnabled)
+        self.genre_count_check.toggled.connect(self.refresh_series_table)
+        self.genre_count_combo.currentIndexChanged.connect(self.refresh_series_table)
+        filter_layout.addRow(self.genre_count_check, self.genre_count_combo)
         filter_layout.addRow(self.show_local_exclusions_check)
         layout.addWidget(filter_box)
 
@@ -381,8 +399,20 @@ class MainWindow(QMainWindow):
         self.btn_suggest_selection.clicked.connect(self.open_selected_kora_suggestions)
         search_row.addWidget(QLabel("Recherche"))
         search_row.addWidget(self.series_table_search_edit, 1)
-        search_row.addWidget(self.btn_suggest_selection)
         layout.addLayout(search_row)
+        suggestion_actions = QHBoxLayout()
+        suggestion_actions.addWidget(self.btn_suggest_selection)
+        self.btn_suggest_nautiljon = QPushButton("Suggestions Nautiljon")
+        self.btn_suggest_nautiljon.setToolTip("Recherche directement dans le CSV complet, sans lien préalable. Les genres Kora existants sont conservés.")
+        self.btn_suggest_nautiljon.clicked.connect(lambda: self.open_selected_kora_suggestions(with_nautiljon=True))
+        self.btn_suggest_nautiljon.setEnabled(False)
+        suggestion_actions.addWidget(self.btn_suggest_nautiljon)
+        self.btn_suggest_combined = QPushButton("Suggestions locales + Nautiljon")
+        self.btn_suggest_combined.setEnabled(False)
+        self.btn_suggest_combined.clicked.connect(lambda: self.open_selected_kora_suggestions(with_nautiljon=True, combined=True))
+        suggestion_actions.addWidget(self.btn_suggest_combined)
+        suggestion_actions.addStretch(1)
+        layout.addLayout(suggestion_actions)
 
         self.series_table = QTableWidget(0, 8)
         self.series_table.setHorizontalHeaderLabels([
@@ -710,7 +740,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, APP_NAME, problem)
         return False
 
-    def run_worker(self, label: str, fn: Callable[[], Any], done: Callable[[Any], None] | None = None) -> None:
+    def run_worker(self, label: str, fn: Callable[[], Any], done: Callable[[Any], None] | None = None,
+                   finished: Callable[[], None] | None = None) -> None:
         self.log(f"▶ {label}")
         worker = Worker(fn)
         self.active_workers.add(worker)
@@ -718,6 +749,8 @@ class MainWindow(QMainWindow):
             worker.signals.result.connect(done)
         worker.signals.error.connect(lambda text: self.log_error(label, text))
         worker.signals.finished.connect(lambda: self.active_workers.discard(worker))
+        if finished is not None:
+            worker.signals.finished.connect(finished)
         self.thread_pool.start(worker)
 
     def test_connection(self) -> None:
@@ -928,7 +961,10 @@ class MainWindow(QMainWindow):
         )
         rows = [
             rec for rec in rows
-            if self._record_matches_effective_kora_filters(
+            if matches_inventory_filters(rec,
+                hide_chapters=self.hide_chapters_check.isChecked(),
+                max_genres=self.genre_count_combo.currentData() if self.genre_count_check.isChecked() else None)
+            and self._record_matches_effective_kora_filters(
                 rec,
                 selected_genre=selected_genre,
                 no_genre=no_genre,
@@ -948,6 +984,7 @@ class MainWindow(QMainWindow):
         self.series_table.setUpdatesEnabled(False)
         self.series_table.blockSignals(True)
         try:
+            self.series_table.clearSelection()
             self.series_table.setRowCount(len(self.current_rows))
             for row_idx, rec in enumerate(self.current_rows):
                 effective_genres = self.effective_kora_genres(rec)
@@ -971,6 +1008,7 @@ class MainWindow(QMainWindow):
         if hidden_local_count:
             status += f" — {hidden_local_count} exclusion(s) locale(s) masquée(s)"
         self.statusBar().showMessage(status)
+        self.on_series_selection_changed()
 
     def _record_matches_effective_kora_filters(
         self,
@@ -1172,7 +1210,10 @@ class MainWindow(QMainWindow):
         records = self.selected_records()
         self.current_record = records[0] if records else None
         if hasattr(self, "btn_suggest_selection"):
-            self.btn_suggest_selection.setEnabled(bool(records))
+            ready = bool(records) and not self._kora_suggestions_busy
+            self.btn_suggest_selection.setEnabled(ready)
+            self.btn_suggest_nautiljon.setEnabled(ready and self.nautiljon_provider is not None)
+            self.btn_suggest_combined.setEnabled(ready)
             self.btn_suggest_selection.setText(
                 f"Suggérer les genres Kora ({len(records)})"
                 if records
@@ -1180,12 +1221,50 @@ class MainWindow(QMainWindow):
             )
         self.populate_detail_selection(records)
 
-    def open_selected_kora_suggestions(self) -> None:
+    def open_selected_kora_suggestions(self, _checked=False, *, with_nautiljon=False, combined=False) -> None:
+        if self._kora_suggestions_busy:
+            self.log("Suggestions Kora : une recherche est déjà en cours.")
+            return
         records = self.selected_records()
         if not records:
             QMessageBox.information(self, APP_NAME, "Sélectionne au moins une série.")
             return
         pending = self.pending_genres_by_series_id()
+        if with_nautiljon:
+            if not self.nautiljon_provider and not combined:
+                QMessageBox.information(self, APP_NAME, "Configure le CSV Nautiljon dans le Toolkit.")
+                return
+            provider = self.nautiljon_provider
+            from .nautiljon_suggestions import nautiljon_only_suggestion, merged_suggestion, NautiljonGenreMatcher
+            def work():
+                import csv
+                error = ""
+                active_client, matcher = None, None
+                try:
+                    if provider is not None:
+                        active_client = provider()
+                        matcher = NautiljonGenreMatcher(active_client)
+                except (OSError, ValueError, RuntimeError, csv.Error) as exc:
+                    if not combined:
+                        raise
+                    active_client, error = None, str(exc)
+                method = merged_suggestion if combined else nautiljon_only_suggestion
+                extra = {"error": error} if combined else {}
+                return [method(record, active_client, matcher=matcher, **extra,
+                    current_genres=pending.get(record.id, record.kora_genres), has_pending=record.id in pending)
+                    for record in records]
+            self._kora_suggestions_busy = True
+            self.on_series_selection_changed()
+            def finish_search():
+                self._kora_suggestions_busy = False
+                self.on_series_selection_changed()
+            try:
+                self.run_worker("Suggestions locales + Nautiljon" if combined else "Suggestions Nautiljon — recherche CSV",
+                                work, self._show_kora_suggestions, finished=finish_search)
+            except Exception:
+                finish_search()
+                raise
+            return
         suggestions = [
             suggest_series_genres(
                 record,
@@ -1194,6 +1273,9 @@ class MainWindow(QMainWindow):
             )
             for record in records
         ]
+        self._show_kora_suggestions(suggestions)
+
+    def _show_kora_suggestions(self, suggestions) -> None:
         dialog = KoraSuggestionDialog(suggestions, self)
         if not dialog.exec():
             return
@@ -1448,12 +1530,44 @@ class MainWindow(QMainWindow):
         self.run_worker("Dry-run" if dry_run else "Application Komga", work, self.after_apply)
 
     def after_apply(self, result: Any) -> None:
-        self.log(f"Résultat : {result}")
+        rows = list(result.get("results") or [])
+        missing = [row for row in rows if row.get("status") == "NOT_FOUND"]
+        failed = [row for row in rows if row.get("status") == "FAILED"]
+        summary = (
+            f"{result.get('count', 0)} série(s) : {result.get('updated_count', 0)} appliquée(s), "
+            f"{result.get('unchanged_count', 0)} déjà conforme(s), "
+            f"{result.get('missing_count', 0)} introuvable(s), "
+            f"{result.get('failed_count', 0)} en erreur, "
+            f"{result.get('not_applied_count', 0)} non traitée(s)."
+        )
+        if result.get("dry_run"):
+            planned = sum(row.get("status") == "DRY_RUN" for row in rows)
+            summary = f"Simulation : {planned} modification(s) prévue(s). " + summary
+        self.log(summary)
         self.invalidate_pending_genres_cache()
         self.refresh_series_table()
         self.refresh_genre_inventory()
         self.refresh_pending_table()
-        QMessageBox.information(self, APP_NAME, f"Terminé. Backup JSON : {result.get('backup_json')}")
+        lines = [summary]
+        if missing:
+            names = ", ".join(str(row.get("title") or row.get("series_id")) for row in missing[:8])
+            lines.append(f"Séries absentes de Komga (restées en attente) : {names}" +
+                         (f"… et {len(missing) - 8} autre(s)." if len(missing) > 8 else "."))
+        if failed:
+            lines.append(f"Première erreur : {failed[0].get('title')} — {failed[0].get('error')}")
+        if result.get("cache_error"):
+            lines.append(f"Cache local non mis à jour : {result['cache_error']}")
+        if result.get("report_error"):
+            lines.append(f"Rapport non enregistré : {result['report_error']}")
+        if result.get("backup_json"):
+            lines.append(f"Sauvegarde avant modification : {result['backup_json']}")
+        if result.get("report_json"):
+            lines.append(f"Rapport complet : {result['report_json']}")
+        message = "\n\n".join(lines)
+        if missing or failed or result.get("not_applied_count") or result.get("cache_error") or result.get("report_error"):
+            QMessageBox.warning(self, APP_NAME, message)
+        else:
+            QMessageBox.information(self, APP_NAME, message)
 
 
     # ------------------------------------------------------------------
@@ -1690,6 +1804,8 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    from ..desktop_theme import apply_dark_theme
+    apply_dark_theme(app)
     window = MainWindow()
     window.show()
     return app.exec()

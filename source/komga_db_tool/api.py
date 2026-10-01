@@ -347,12 +347,15 @@ class KomgaApi:
             last_timeout: Optional[HttpError] = None
             for attempt in range(3):
                 try:
-                    data = self.client.request_json(
-                        "POST",
-                        path,
-                        body=body,
-                        query={"page": page, "size": page_size, "sort": sort},
-                    )
+                    # Serialize requests, not an entire library traversal. The
+                    # lock is released between pages and before retry backoff.
+                    with KOMGA_LIST_LOCK:
+                        data = self.client.request_json(
+                            "POST",
+                            path,
+                            body=body,
+                            query={"page": page, "size": page_size, "sort": sort},
+                        )
                     break
                 except HttpError as exc:
                     if not _is_retryable_list_error(exc) or attempt >= 2:
@@ -406,18 +409,17 @@ class KomgaApi:
         for body in bodies:
             body_rejected = False
             for adaptive_page_size in page_sizes:
-                with KOMGA_LIST_LOCK:
-                    try:
-                        return self._list_paged(path, body, sort=sort, page_size=adaptive_page_size)
-                    except HttpError as exc:
-                        if exc.status == 400:
-                            errors.append(f"body={body!r}: {exc.body[:300]}")
-                            body_rejected = True
-                            break
-                        if _is_retryable_list_error(exc) and adaptive_page_size > page_sizes[-1]:
-                            errors.append(f"body={body!r}, page_size={adaptive_page_size}: {exc.body[:160]}")
-                            continue
-                        raise
+                try:
+                    return self._list_paged(path, body, sort=sort, page_size=adaptive_page_size)
+                except HttpError as exc:
+                    if exc.status == 400:
+                        errors.append(f"body={body!r}: {exc.body[:300]}")
+                        body_rejected = True
+                        break
+                    if _is_retryable_list_error(exc) and adaptive_page_size > page_sizes[-1]:
+                        errors.append(f"body={body!r}, page_size={adaptive_page_size}: {exc.body[:160]}")
+                        continue
+                    raise
             if body_rejected:
                 continue
         raise RuntimeError(f"Aucun body de recherche compatible pour {path}. Erreurs: {' | '.join(errors)}")
@@ -657,10 +659,17 @@ class KomgaApi:
         *,
         page: int = 0,
         page_size: int = 50,
+        sort: str = "metadata.numberSort,asc",
     ) -> Dict[str, Any]:
         """Return one Komga book page without loading the complete library."""
         page = max(0, int(page))
-        page_size = min(200, max(1, int(page_size)))
+        page_size = min(500, max(1, int(page_size)))
+        if sort not in {
+            f"{field},{direction}"
+            for field in ("createdDate", "metadata.numberSort", "metadata.title", "metadata.releaseDate")
+            for direction in ("asc", "desc")
+        }:
+            raise ValueError("Tri de tomes Komga non pris en charge")
         conditions = []
         if library_id:
             conditions.append(_condition_for("libraryId", library_id))
@@ -683,7 +692,7 @@ class KomgaApi:
         data = self._list_page_with_fallback(
             "/api/v1/books/list",
             bodies,
-            "metadata.numberSort,asc",
+            sort,
             page,
             page_size,
         )
