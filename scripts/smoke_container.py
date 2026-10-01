@@ -2,7 +2,7 @@
 import json
 import re
 import time
-from urllib.error import URLError
+from http.client import HTTPException
 from urllib.request import urlopen
 
 BASE = "http://127.0.0.1:8000"
@@ -20,7 +20,7 @@ for attempt in range(30):
     try:
         health = json.loads(get("/api/health"))
         break
-    except (URLError, TimeoutError):
+    except (OSError, HTTPException):
         if attempt == 29:
             raise
         time.sleep(2)
