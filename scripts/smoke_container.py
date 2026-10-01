@@ -6,7 +6,7 @@ from http.client import HTTPException
 from urllib.request import urlopen
 
 BASE = "http://127.0.0.1:8000"
-VERSION = "2.52.0"
+VERSION = "2.53.0"
 REFERENCE = "desktop-v3.12.0rc52-20261001"
 
 
@@ -42,4 +42,5 @@ for asset in assets:
         javascript.append(content)
 assert len(javascript) == 1
 assert VERSION in javascript[0]
+assert "#7c9fff" in get(next(asset for asset in assets if asset.endswith(".css")))
 print(f"Validated health, reference and static assets: {VERSION} / {REFERENCE}")

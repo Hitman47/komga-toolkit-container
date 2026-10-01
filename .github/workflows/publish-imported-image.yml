@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 20
     env:
       IMAGE: ghcr.io/hitman47/komga-toolkit-container
-      RELEASE: 2.52.0
+      RELEASE: 2.53.0
     steps:
       - name: Check out validated container snapshot
         uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
           context: ./source
           load: true
           push: false
-          tags: ghcr.io/hitman47/komga-toolkit-container:2.52.0
+          tags: ghcr.io/hitman47/komga-toolkit-container:2.53.0
 
       - name: Test isolated read-only runtime and WebUI version
         run: |

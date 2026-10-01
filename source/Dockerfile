@@ -1,6 +1,6 @@
 FROM python:3.12-slim AS runtime
 LABEL org.opencontainers.image.title="Komga Toolkit WebUI" \
-      org.opencontainers.image.version="2.52.0" \
+      org.opencontainers.image.version="2.53.0" \
       org.opencontainers.image.description="WebUI Docker alignée sur Komga Toolkit Desktop V2" \
       io.komga-toolkit.reference="desktop-v3.12.0rc52-20261001"
 ENV PYTHONDONTWRITEBYTECODE=1 \

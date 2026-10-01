@@ -3,7 +3,7 @@ from __future__ import annotations
 
 REFERENCE_ID = "desktop-v3.12.0rc52-20261001"
 REFERENCE_NAME = "Komga Toolkit Desktop 3.12.0rc52"
-WEB_API_VERSION = "2.52.0"
+WEB_API_VERSION = "2.53.0"
 
 # Public, non-sensitive contract used by the WebUI and deployment checks.
 CAPABILITIES = (

@@ -1,7 +1,7 @@
 # Komga Toolkit WebUI container
 
 Public container releases for the Komga Toolkit WebUI reference
-`desktop-v3.12.0rc52-20261001` (Web API and bundle `2.52.0`).
+`desktop-v3.12.0rc52-20261001` (Web API and bundle `2.53.0`).
 
 The image is intended for Docker Compose and Portainer deployments:
 
@@ -19,17 +19,19 @@ code applicatif nécessaire à l’image. Il ne contient ni configuration locale
 ni identifiant, ni exécutable Desktop.
 
 Le tag `desktop-v2` est stable et pointe toujours vers la dernière publication
-validée. Les tags versionnés `2.52.0` et `2.52.0-desktop-v2` restent disponibles
+validée. Les tags versionnés `2.53.0` et `2.53.0-desktop-v2` restent disponibles
 pour revenir à une version antérieure.
 
 Pour Portainer, utilisez `docker-compose.portainer.yml` ou remplacez l'image
-du stack existant par `ghcr.io/hitman47/komga-toolkit-container:2.52.0`, puis
+du stack existant par `ghcr.io/hitman47/komga-toolkit-container:2.53.0`, puis
 recréez le service en conservant son volume `/data`. La publication d'une image
 ne met pas à jour automatiquement les conteneurs déjà déployés.
 
 Cette version inclut les catalogues de secours, les fichiers sources centralisés,
 le rafraîchissement explicite des inventaires et le choix de 500 lignes pour les
-écrans de sorties. Le nouveau thème rc52 reste propre à l'application Desktop.
+écrans de sorties. La version Web 2.53.0 reprend également la palette sombre de
+Windows : navigation repliable et recherchable, filtres adaptatifs, tableaux
+alternés et dialogues harmonisés. Aucune règle métier n'est modifiée.
 
 ## Historique des versions précédentes
 
